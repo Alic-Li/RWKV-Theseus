@@ -1,11 +1,13 @@
 # RWKV-Theseus
 
-用原生 PyTorch/torchrun 将 Qwen 的 16 个 full-attention 分支从浅到深替换为独立 RWKV7 TimeMix。HF 负责模型加载、Qwen forward、GDN、RoPE、norm 与 MLP；仅当前阶段新层可训练。无 Lightning、DeepSpeed、Accelerate、Trainer、TP、PP。
+RWKV-Theseus 是一个基于原生 PyTorch 的实验性训练框架，用于将 Qwen3.8-27B 中的 16 个 Full Attention 层逐层迁移为 RWKV7 TimeMix。模型加载与冻结前缀计算直接使用 Hugging Face 实现；每个阶段仅训练当前新增的 TimeMix 层。项目不依赖 Lightning、DeepSpeed、Accelerate、Trainer、张量并行或流水线并行。
 
-本地 `Qwen3.8-27B` 的 config 实际类型是 `qwen3_5`，64 个 block 中迁移顺序为 `3,7,...,63`，其余 48 个 GDN 保留。训练仅运行目标层之前的冻结前缀和目标 Attention/TimeMix；目标 block 的 FFN 与后续 block 不执行。详见 [架构设计](ARCHITECTURE_zh.md) 和 [实现验证记录](VERIFICATION.md)。
+对于当前 Qwen3.8-27B 权重，模型包含 64 个 decoder block，其中 16 个为 Full Attention，迁移顺序为 `3, 7, ..., 63`；其余 48 个 Gated DeltaNet 层保持不变。训练阶段只执行目标层之前的冻结前缀和目标 Attention/TimeMix 分支，不执行目标 block 的 FFN 及其后的 decoder block。详细设计参见 [架构说明](ARCHITECTURE_zh.md)，验证信息保存在仓库的测试和 `verification.json` 中。
+
+本项目面向研究和工程验证，当前接口、性能和 checkpoint 格式可能随实验迭代调整。
 
 
-## 安装
+## 安装与环境要求
 
 以下命令均从 `RWKV-Theseus/` 执行。需要 Linux、支持 BF16 的 NVIDIA GPU，以及 CUDA toolkit/nvcc。正式训练支持一张或多张 GPU，每张 GPU 放一份完整文本模型；27B 权重实测约 53.8 GB，另需优化器、缓存、激活和 CUDA workspace。
 
@@ -16,7 +18,7 @@ uv pip install --index-url https://mirrors.ustc.edu.cn/pypi/simple -e '.[test,tr
 export CUDA_HOME=/usr/local/cuda  # 按本机实际路径设置
 ```
 
-启动脚本使用当前激活环境的 Python，不依赖项目 `.venv`。其他机器可以自行使用 UV 创建环境。HF 缓存适配目前显式支持 Transformers 5.8.0 和 5.17.0；版本范围用于避免安装时降级已有 Torch，其他 HF 版本仍需要兼容性测试。`requirements-lock.txt` 保留最初 Torch 2.10 / Transformers 5.8 的本地测试环境记录，不用于升级现有共享环境。没有安装 FLA/causal-conv1d 时，HF 使用自身 PyTorch GDN 实现，可以运行但吞吐较低。
+启动脚本使用当前激活环境中的 Python，不依赖项目 `.venv`。其他机器可以使用 UV 创建独立环境。当前明确支持 Transformers 5.8.0 和 5.17.0；其他版本需要自行进行兼容性验证。`requirements-lock.txt` 仅保留初始测试环境记录，不用于强制升级共享环境。未安装 FLA 或 `causal-conv1d` 时，HF 会回退到 PyTorch GDN 实现，功能仍可运行，但吞吐会降低。
 
 CUDA recurrence 首次使用时通过 `torch.utils.cpp_extension.load` 编译。建议多卡启动前先编译一次：
 
@@ -36,7 +38,7 @@ TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=8 \
 
 安装后运行 `python -c 'import causal_conv1d; print(causal_conv1d.__version__)'` 确认扩展可加载。`TORCH_CUDA_ARCH_LIST` 应按机器算力调整；上面的 `12.0` 只针对当前 Blackwell 服务器。
 
-本机测试使用 CUDA toolkit 13.3、PyTorch cu128、GCC 15。可用 `CC=gcc-15 CXX=g++-15` 指定本机已有的编译器；不要求其他机器也使用这个组合。CUDA 翻译单元不包含 PyTorch C++ 头文件，减少 nvcc/宿主编译器兼容问题。
+本项目已在 CUDA toolkit 13.3、PyTorch cu128 和 GCC 15 环境中验证。其他环境可使用兼容的 CUDA、PyTorch 和宿主编译器组合；不要求与该测试环境完全一致。
 
 ## 数据输入
 
@@ -134,7 +136,7 @@ data/
 - `sources` 可以有多项；`weight` 必须为正有限数。权重归一化后表示每次选择来源的概率，不是精确 token 比例。
 - `documents`、`token_count`、来源名称等字段可以作为额外元数据写入，但当前 reader 不依赖它们。
 
-训练启动前会完整校验 manifest 引用文件的 SHA256，训练期间通过只读 NumPy memmap 按需读取，不把全部 token 加载进内存。
+训练启动前会完整校验 manifest 引用文件的 SHA256。训练期间通过只读 NumPy memmap 按需读取数据，不会将全部 token 加载到内存。
 
 ### 每阶段完整遍历与状态
 
@@ -173,7 +175,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS=4 bash scripts/torchrun.sh
 
 每张 GPU 都运行一份冻结模型和一个当前可训练 TimeMix。冻结前缀只计算一次，当前 FullAttention 和 TimeMix 共享输入；只有 TimeMix 参与所有 rank 的 DDP。支持 1、2、3、4、8 等 GPU 数，不再区分 teacher/student 卡。四卡每步有四份独立样本，旧架构只有两份；相同步数下有效 token 预算随之增加。
 
-默认每个 stage 完整遍历训练集一次；16 个 stage 会在一个命令中自动从浅到深连续运行，不需要手工逐阶段启动。每阶段结束时框架会验证、保存 complete checkpoint、冻结当前 TimeMix、广播权重并自动进入下一阶段。
+默认每个 stage 完整遍历训练集一次；16 个 stage 会在同一个命令中从浅到深连续运行，无需手动逐阶段启动。每阶段结束后，框架执行验证、保存 complete checkpoint、冻结当前 TimeMix、广播权重并自动进入下一阶段。
 
 先跑一个 optimizer update 的 smoke test：
 
@@ -191,7 +193,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS=4 \
 bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
 ```
 
-不要对已有 `latest` 的 output 再次无 `--resume` 启动；框架会拒绝覆盖。阶段中恢复要求 world size 和 rank 对应的设备映射不变，阶段边界 complete checkpoint 可以更换拓扑并从该阶段的数据起点继续。
+如果 output 中已经存在 `latest`，必须使用 `--resume` 或指定新的 output 目录；框架会拒绝直接覆盖已有运行。阶段中断恢复要求 world size 和 rank 到设备的映射保持不变；从阶段边界的 complete checkpoint 恢复时，可以更换拓扑并从该阶段的数据起点继续。
 
 所有进程由同一个 torchrun 启动。Gloo world group 用于配置检查、checkpoint 和阶段广播；一个覆盖全部 rank 的 NCCL group 用于 TimeMix DDP。没有跨卡 token/hidden 传输，也没有配对 header/ACK。单卡也通过 `torchrun --nproc_per_node=1` 启动。
 
@@ -228,8 +230,8 @@ torchrun --nnodes=2 --node_rank="$NODE_RANK" --nproc_per_node=8 \
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `chunk_tokens` | `256` | 单次 recurrent forward/backward 的最大 token 数；短尾不会 padding |
-| `context_tokens` | `4096` | 一个状态连续窗口的最大长度；超过该边界后重置 HF cache 和 TimeMix state |
+| `chunk_tokens` | `512` | 单次 recurrent forward/backward 的最大 token 数；短尾不会 padding |
+| `context_tokens` | `16384` | 一个状态连续窗口的最大长度；超过该边界后重置 HF cache 和 TimeMix state |
 | `grad_accum_steps` | `1` | 每次 optimizer update 累积的 chunk 数；只有最后一个 micro-step 做 student DDP 同步 |
 | `training_mode` | `epoch` | 每阶段完整遍历全部 token；`sampled` 为旧的定步数采样模式 |
 | `stage_steps` | `1000` | 仅 sampled 模式生效，epoch 模式自动计算并忽略此值 |
@@ -303,7 +305,7 @@ bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
 
 `rank_profile` 在日志 step 记录各 rank 的 teacher 耗时、token 长度、上下文位置与 reset 标记。该诊断会额外同步计时，正常训练保持默认关闭。启动命令中的七个设备代表七张卡。数据采样、文件和 manifest 不受上述优化影响。
 
-2026-09-22 云端 7 张 RTX PRO 6000 的对照：保持 `chunk_tokens=512`、`context_tokens=16384`、同一数据顺序和训练超参，分别运行 40 步。排除第 1 步，第 2～40 步均处理 120,493 个有效 token；旧版约 2,115 token/s，保留编译缓存重跑旧版约 2,113 token/s，512-token recurrent 分发约 15,027 token/s。单步超过 1 秒的次数从 16 次降到 0 次；第 40 步 NMSE 差约 `4.4e-5`。这是包含不同长度首次调用开销的短程测试，不能当作整个 epoch 的固定加速倍数。诊断日志位于云端 `/tmp/theseus-perf512-4vv3ythv/`，验证和定期保存在对照中关闭，生产配置未修改。
+在 7 张 NVIDIA RTX PRO 6000 上进行的短程对照中，使用 `chunk_tokens=512`、`context_tokens=16384`、相同数据顺序和训练超参数时，优化后的冻结 GDN 路径显著减少了不同 rank 之间的等待。该结果仅用于说明实现方向，不代表所有硬件和完整训练阶段的固定加速比例。
 
 ## W&B 指标记录
 
@@ -376,7 +378,7 @@ with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
     logits = runner.model.lm_head(hidden)
 ```
 
-不是无需定制就能由 stock AutoModel 加载的纯 HF checkpoint，也未接入现有 C++ 推理工程的权重格式。
+该导出结果不是可由标准 Hugging Face `AutoModel` 直接加载的纯 HF checkpoint，也不兼容现有 C++ 推理工程的权重格式。
 
 ## 测试和探针
 
