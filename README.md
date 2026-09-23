@@ -385,6 +385,49 @@ with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
 
 该导出结果不是可由标准 Hugging Face `AutoModel` 直接加载的纯 HF checkpoint，也不兼容现有 C++ 推理工程的权重格式。
 
+### 将阶段权重写入旧 GDN 转换产物
+
+如果已有 `convert_qwen2rwkv_lightning.py` 生成的 hybrid `.pth`，可用独立脚本把下载的 Theseus `migrated.safetensors` 写入指定 Full Attention 层。层号从 0 开始，第一阶段是第 3 层。脚本递归扫描权重目录中的 `.safetensors`，按路径中的数字自然排序；同一个参数出现多次时，后面的文件覆盖前面的版本，并在输出中报告覆盖次数。每个指定层必须具有完整的 TimeMix 参数。
+
+```bash
+python replace_timemix_lightning.py \
+  --base ../converted/Qwen3.8-27B-RWKV7-Hybrid.pth \
+  --weights-dir /path/to/downloaded-checkpoints \
+  --layers 3 \
+  --out ../converted/Qwen3.8-27B-stage01-shared-wkv.pth \
+  --dry-run
+
+# 检查通过后去掉 --dry-run；--verify 可额外回读并逐字节校验整个输出。
+python replace_timemix_lightning.py \
+  --base ../converted/Qwen3.8-27B-RWKV7-Hybrid.pth \
+  --weights-dir /path/to/downloaded-checkpoints \
+  --layers 3 \
+  --out ../converted/Qwen3.8-27B-stage01-shared-wkv.pth
+```
+
+可用 `--layers 3,7,11` 一次替换多层。默认将训练时 FP32 的 TimeMix 权重转换为基座 `.pth` 的 dtype；`--dtype source` 保留 safetensors 原始 dtype。输出包括新的 `.pth`、`.config.json` 和 `.manifest.json`；基座文件不会被修改。
+
+输出沿用 GDN 转换产物的 `rwkv_lightning_qwen_hybrid_v1` 格式、plain state_dict、`blocks.<层号>.att.*` 命名和 `[out,in]` 连续矩阵布局。`w1/w2/a1/a2/g1/g2` 从 Theseus 的 `[in,out]` 转置，`[1,1,C]` 广播参数压平为 `[C]`，`r_k` 保留 `[heads,head_size]`；manifest 记录变换。GDN 和 TimeMix 是不同算子，其各自专有参数和形状必须保留，不能把 TimeMix 的 23 个参数冒充 GDN 的卷积、decay/beta 参数。共同投影沿用 `receptance.weight/key.weight/value.weight/output.weight/ln_x.weight` 名称。
+
+`--weights ../migrated.safetensors` 可直接指定单个文件，不必整理目录。可以继续以已替换的 canonical hybrid 为基座替换后续层；也允许将 GDN 层替换为同层号的完整 TimeMix 权重。旧脚本的 `rwkv_lightning_qwen_hybrid_timemix_v1` 产物需从原 hybrid 基座重新导出。
+
+更新后的 `rwkv_lightning_cuda` hybrid 后端按每层实际权重特征选择 GDN、TimeMix 或 Attention；`geometry.layer_types` 用于记录，不强制周期或比例。支持纯 Attention、纯 TimeMix、连续 TimeMix 以及任意三类混排。TimeMix 使用独立 shift 与 FP32 WKV 状态，没有跨层 `v_first`，保留 Qwen RMSNorm 和 SwiGLU FFN。GDN 与 TimeMix 的状态更新统一调用 `rwkv_wkv_effective_fp32_launch`，底层为同一份 D64/D128 模板内核；支持两者都用 128，也支持不同 head size 混用。GDN 保留 conv4，Attention 使用原有 Qwen GQA/RoPE 配置。
+
+转换脚本默认从每层 `r_k` 自动推断 head size，不再默认写死 64。`--head-size 128` 用于校验输入确实为 D128 权重，不会把 D64 权重重新分头。配置会记录 `contract.wkv_kernel=shared_dplr_fp32_v1` 和每个 recurrent 层的 `wkv_layers`。新训练若需要 D128，请在训练配置设置 `"head_size": 128`。现有 `migrated.safetensors` 是 D64，其原始分组会保留。
+
+本机导出及验证命令（工作目录为 `qwen2rwkv`）：
+
+```bash
+/home/alic-li/python_env/py312/bin/python RWKV-Theseus/replace_timemix_lightning.py \
+  --base converted/Qwen3.8-27B-RWKV7-Hybrid.pth \
+  --weights migrated.safetensors --layers 3 \
+  --out converted/Qwen3.8-27B-stage01-shared-wkv.pth --verify
+
+rwkv_lightning_cuda/build-hybrid/rwkv_lighting_cuda \
+  --model-path converted/Qwen3.8-27B-stage01-shared-wkv.pth \
+  --vocab-path Qwen3.8-27B/tokenizer.json --host 127.0.0.1 --port 8000
+```
+
 ## 测试和探针
 
 ```bash
