@@ -152,7 +152,8 @@ def test_local_branch_matches_separate_teacher_and_only_trains_timemix():
 
 
 @__import__("pytest").mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_gdn_inference_dispatch_matches_chunk_across_resets(monkeypatch):
+@__import__("pytest").mark.parametrize("batch_size", [1, 2])
+def test_gdn_inference_dispatch_matches_chunk_across_resets(monkeypatch, batch_size):
     import transformers
     if transformers.__version__ != "5.17.0":
         __import__("pytest").skip("HF 5.17 kernel dispatch")
@@ -175,7 +176,7 @@ def test_gdn_inference_dispatch_matches_chunk_across_resets(monkeypatch):
         if reset:
             a.reset()
             b.reset()
-        ids = torch.randint(0, 64, (1, length), device="cuda")
+        ids = torch.randint(0, 64, (batch_size, length), device="cuda")
         monkeypatch.setenv("THESEUS_GDN_KERNEL", "chunk")
         expected = a.forward(ids)
         monkeypatch.setenv("THESEUS_GDN_KERNEL", "auto")

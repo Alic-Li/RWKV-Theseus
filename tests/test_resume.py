@@ -139,3 +139,19 @@ def test_epoch_uneven_ranks_exact_coverage_and_resume(tmp_path):
         x = torch.load(complete/"ranks"/f"rank_{rank:05d}.pt", weights_only=False)
         y = torch.load(resumed/"ranks"/f"rank_{rank:05d}.pt", weights_only=False)
         assert x["reader"] == y["reader"]
+
+
+def test_batched_epoch_single_rank_training_and_resume(tmp_path):
+    cfg, path = make_config(tmp_path, 1)
+    cfg.update(training_mode="epoch", micro_batch_size=2, context_tokens=7,
+               original_teacher_kl=False, validation_interval=0, validation_chunks=1)
+    path.write_text(json.dumps(cfg))
+    launch(path, ranks=1, extra=("--stop-after", "1"))
+    launch(path, ranks=1, extra=("--resume", str(tmp_path / "full")))
+    checkpoint, meta, _ = read_checkpoint(tmp_path / "full")
+    assert meta["complete"]
+    state = torch.load(checkpoint / "ranks" / "rank_00000.pt", weights_only=False)
+    assert state["reader"]["consumed_tokens"] == 37
+    cfg["micro_batch_size"] = 4
+    path.write_text(json.dumps(cfg))
+    launch(path, ranks=1, extra=("--resume", str(tmp_path / "full")))

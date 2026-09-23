@@ -37,14 +37,14 @@ if transformers.__version__ == "5.17.0":
 
     @wraps(_chunk_gdn)
     def _inference_gdn(query, key, value, **kwargs):
-        # Frozen B=1 short chunks are faster with HF's fused recurrent dispatch.
+        # Frozen short chunks use HF's fused recurrent dispatch for every batch lane.
         # Its token loop handles varying lengths without per-length chunk JIT.
         # Include 512-token training chunks and their 257..511-token tails:
         # otherwise a new tail length can stall one rank in chunk-kernel JIT.
-        # Keep chunk/autograd kernels for longer/batched or differentiable work.
+        # Keep chunk/autograd kernels for longer or differentiable work.
         if (_has_fla and os.environ.get("THESEUS_GDN_KERNEL", "auto") != "chunk"
                 and query.is_cuda and query.dtype == torch.bfloat16
-                and query.shape[0] == 1 and query.shape[1] <= 512
+                and query.shape[1] <= 512
                 and not torch.is_grad_enabled()):
             return _qwen.torch_recurrent_gated_delta_rule(query, key, value, **kwargs)
         return _chunk_gdn(query, key, value, **kwargs)

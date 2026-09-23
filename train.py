@@ -7,8 +7,13 @@ import random
 import time
 import warnings
 import os
-from tqdm.auto import tqdm
 from pathlib import Path
+
+# HF's growing KV cache otherwise fragments the CUDA caching allocator across
+# long windows. Respect an explicit allocator configuration from the caller.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+from tqdm.auto import tqdm
 
 # Known upstream deprecations and FLA's shape heuristic are noisy in this exact
 # path. The Qwen call is [B,T,H,...]; T < H is valid for a short document tail.
@@ -137,6 +142,8 @@ def _run(cfg, resume, stop_after, tracker):
                 group["initial_lr"] = cfg["lr"]
             restore_rng(local["rng"])
         topo.barrier()
+        if topo.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(topo.device)
         emit(topo, cfg, "stage_start", stage=stage + 1, layer=layer, step=step0)
         tracker.epoch_steps = max_steps
         if cfg["training_mode"] == "epoch":
@@ -157,7 +164,8 @@ def _run(cfg, resume, stop_after, tracker):
             optimizer.zero_grad(set_to_none=True)
             for micro in range(cfg["grad_accum_steps"]):
                 batch = reader.next()
-                sync = nullcontext() if micro == cfg["grad_accum_steps"] - 1 else ddp.no_sync()
+                sync = (nullcontext() if topo.world == 1 or micro == cfg["grad_accum_steps"] - 1
+                        else ddp.no_sync())
                 if batch is None:
                     # Keep collective ordering identical on exhausted ranks. A
                     # zero-loss dummy touches the same DDP graph, but contributes
@@ -185,7 +193,8 @@ def _run(cfg, resume, stop_after, tracker):
                 if profile:
                     topo.synchronize()
                     teacher_seconds += time.perf_counter() - teacher_started
-                    profile_batches.append({"tokens": ids.shape[1], "position": batch["position"], "reset": batch["reset"]})
+                    profile_batches.append({"tokens": ids.numel(), "batch_size": ids.shape[0],
+                                            "position": batch["position"], "reset": batch["reset"]})
                 x, target = capture.x, capture.y
                 with sync:
                     with torch.autocast(topo.device.type, dtype=torch.bfloat16):
@@ -219,10 +228,13 @@ def _run(cfg, resume, stop_after, tracker):
                                      cosine=f"{current_metrics['cosine']:.5f}", refresh=False)
                 progress.update(1)
                 if log_step:
+                    memory = ({"peak_allocated_gb": torch.cuda.max_memory_allocated(topo.device) / 1e9,
+                               "peak_reserved_gb": torch.cuda.max_memory_reserved(topo.device) / 1e9}
+                              if topo.device.type == "cuda" else {})
                     emit(topo, cfg, "train", stage=stage + 1, layer=layer, step=step,
                          lr=lr_used, grad_norm=grad_norm.item(),
                          seconds_per_step=elapsed / throughput_steps,
-                         tokens_per_second=throughput_tokens / elapsed, **current_metrics)
+                         tokens_per_second=throughput_tokens / elapsed, **current_metrics, **memory)
                     throughput_started = time.perf_counter()
                     throughput_steps = throughput_tokens = 0
             complete = step == max_steps

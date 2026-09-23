@@ -116,6 +116,7 @@ class EpochTokenStream(TokenStream):
             parts.append(np.column_stack((np.full(len(docs), source), starts, ends)))
         windows = np.concatenate(parts).astype(np.int64, copy=False)
         np.random.default_rng(self.seed).shuffle(windows)
+        self._all_windows = windows if getattr(self, "micro_batch_size", 1) > 1 else None
         costs = (windows[:, 2] - windows[:, 1] + self.chunk_tokens - 1) // self.chunk_tokens
         self.rank_chunks = [int(costs[r::self.pairs].sum()) for r in range(self.pairs)]
         self.total_tokens = sum(len(tokens) for tokens, _ in self.sources)
@@ -147,3 +148,75 @@ class EpochTokenStream(TokenStream):
             raise ValueError("A sampled reader checkpoint cannot resume an exhaustive epoch")
         self.consumed_tokens = state["consumed_tokens"]
         super().load_state_dict(state)
+
+
+class BatchedEpochTokenStream(EpochTokenStream):
+    """Pack equal-length, disjoint windows into independent batch lanes.
+
+    Every lane starts at position zero and ends at the same position, so the
+    shared HF cache and TimeMix state can be reset between groups without
+    padding, masking, or mixing context across documents.
+    """
+
+    def __init__(self, *args, micro_batch_size, **kwargs):
+        if micro_batch_size < 2:
+            raise ValueError("Batched reader requires micro_batch_size >= 2")
+        self.micro_batch_size = micro_batch_size
+        super().__init__(*args, **kwargs)
+        self.groups = self._pack(self.windows)
+        self.rank_chunks = []
+        for rank in range(self.pairs):
+            rank_windows = self._all_windows[rank::self.pairs]
+            lengths, counts = np.unique(rank_windows[:, 2] - rank_windows[:, 1], return_counts=True)
+            self.rank_chunks.append(int((((counts + micro_batch_size - 1) // micro_batch_size)
+                                         * ((lengths + self.chunk_tokens - 1) // self.chunk_tokens)).sum()))
+        del self.windows, self._all_windows
+        self.group = self.offset = 0
+
+    def _pack(self, windows):
+        pending = {}
+        groups = []
+        for row in windows:
+            length = int(row[2] - row[1])
+            bucket = pending.setdefault(length, [])
+            bucket.append(row)
+            if len(bucket) == self.micro_batch_size:
+                groups.append(np.asarray(bucket, dtype=np.int64))
+                pending[length] = []
+        groups.extend(np.asarray(bucket, dtype=np.int64) for bucket in pending.values() if bucket)
+        return groups
+
+    @property
+    def exhausted(self):
+        return self.group >= len(self.groups)
+
+    def next(self):
+        if self.exhausted:
+            return None
+        group = self.groups[self.group]
+        end = min(int(group[0, 2] - group[0, 1]), self.offset + self.chunk_tokens)
+        values = np.stack([np.asarray(self.sources[int(source)][0][int(start) + self.offset:int(start) + end],
+                                      dtype=np.int64) for source, start, _ in group])
+        result = {"ids": torch.from_numpy(values), "reset": self.offset == 0,
+                  "position": self.offset, "group": self.group}
+        self.consumed_tokens += values.size
+        self.offset = end
+        if end == group[0, 2] - group[0, 1]:
+            self.group += 1
+            self.offset = 0
+        return result
+
+    def state_dict(self):
+        return {"reader_mode": "batched_epoch_v1", "fingerprint": self.fingerprint,
+                "pair_id": self.pair_id, "pairs": self.pairs, "seed": self.seed,
+                "chunk_tokens": self.chunk_tokens, "context_tokens": self.context_tokens,
+                "sampler_version": SAMPLER_VERSION, "micro_batch_size": self.micro_batch_size,
+                "group": self.group, "offset": self.offset, "consumed_tokens": self.consumed_tokens}
+
+    def load_state_dict(self, state):
+        own = self.state_dict()
+        for key in own.keys() - {"group", "offset", "consumed_tokens"}:
+            if own[key] != state.get(key):
+                raise ValueError(f"Reader resume mismatch: {key}")
+        self.group, self.offset = state["group"], state["offset"]
+        self.consumed_tokens = state["consumed_tokens"]

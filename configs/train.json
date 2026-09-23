@@ -22,6 +22,7 @@
   "constant_steps": 3000,
   "min_lr": 0.000003,
   "grad_accum_steps": 1,
+  "micro_batch_size": 8,
   "clip_norm": 1.0,
   "cosine_weight": 0.0,
   "loss_epsilon": 1e-06,

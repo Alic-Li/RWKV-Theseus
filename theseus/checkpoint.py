@@ -129,8 +129,11 @@ def validate_resume(meta, cfg, topo, base_id, order):
             raise ValueError(f"{name} manifest changed")
     mutable = {"output", "log_interval", "checkpoint_interval", "validation_interval", "timeout_minutes",
                "lr", "warmup_steps", "constant_steps", "min_lr"}
+    if meta["complete"]:
+        mutable.add("micro_batch_size")
     for key in cfg.keys() - mutable - {k for k in cfg if k.startswith("wandb_")}:
-        if cfg[key] != meta["config"].get(key, "sampled" if key == "training_mode" else None):
+        default = "sampled" if key == "training_mode" else 1 if key == "micro_batch_size" else None
+        if cfg[key] != meta["config"].get(key, default):
             raise ValueError(f"Resume config changed: {key}")
     if not meta["complete"]:
         if meta.get("training_topology") != "local_branch_v1":

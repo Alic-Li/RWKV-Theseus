@@ -24,10 +24,14 @@ def prepare_student(model, layer, cfg, topo, weights=None, *, total_steps):
     model.requires_grad_(False)
     adapter = install(model, layer, cfg, weights=weights, trainable=True, retain_teacher=True)
     adapter.debug_input = cfg["debug_input"]
-    ddp_options = {"forward_sync_buffers": False} if "forward_sync_buffers" in inspect.signature(DDP).parameters else {"broadcast_buffers": False}
-    ddp = DDP(adapter.core, process_group=topo.student_group,
-              device_ids=[topo.local_rank] if topo.device.type == "cuda" else None,
-              **ddp_options)
+    if topo.world == 1:
+        ddp = adapter.core
+    else:
+        ddp_options = ({"forward_sync_buffers": False} if "forward_sync_buffers" in inspect.signature(DDP).parameters
+                       else {"broadcast_buffers": False})
+        ddp = DDP(adapter.core, process_group=topo.student_group,
+                  device_ids=[topo.local_rank] if topo.device.type == "cuda" else None,
+                  **ddp_options)
     adapter.__dict__["train_call"] = ddp
     decay, no_decay = [], []
     for name, p in adapter.core.named_parameters():

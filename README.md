@@ -144,6 +144,8 @@ data/
 
 每篇文档从头到尾切为最多 `context_tokens` 的窗口，窗口再切为最多 `chunk_tokens` 的连续 chunk，所有短尾保留，不 padding、不跨文档。窗口按 seed 确定性打乱并分配给不同 rank；每个 stage 重放相同完整遍历顺序。窗口内保留 recurrent/cache 状态，窗口切换 reset。
 
+`micro_batch_size > 1` 时，每个 rank 将等长窗口打包成一个 batch，窗口各占一条独立 lane。整组窗口从位置零同步前进，组结束后一起重置 cache 和 TimeMix state。短尾按实际长度分组，最后不足一个 batch 的组直接以较小 batch 运行；所有 token 仍只遍历一次。为了保持独立上下文和避免 padding，打包会改变原先单样本窗口的处理顺序。此模式目前用于 `epoch`，`sampled` 模式保持单样本。
+
 step 数由完整遍历的实际 chunk 数、world size、梯度累积次数计算；epoch 模式忽略 `stage_steps`。tqdm 总数是本阶段实际 optimizer step 数。先耗尽的 rank 通过零损失 dummy 保持 DDP 同步，不增加有效 token，也不更新自己的 recurrent state。最终不完整的累积批次按实际有效 token 归一化。
 
 每 3000 个 optimizer step 保存 checkpoint，阶段结束额外保存 complete checkpoint。中途恢复保存每 rank 的窗口编号、chunk offset、已消费 token 数和模型状态。旧 sampled 模式 checkpoint 不能直接作为 epoch 游标恢复；默认配置使用新的 `runs/theseus_shallow_to_deep`，旧 runs 保留。
@@ -233,6 +235,9 @@ torchrun --nnodes=2 --node_rank="$NODE_RANK" --nproc_per_node=8 \
 | `chunk_tokens` | `512` | 单次 recurrent forward/backward 的最大 token 数；短尾不会 padding |
 | `context_tokens` | `16384` | 一个状态连续窗口的最大长度；超过该边界后重置 HF cache 和 TimeMix state |
 | `grad_accum_steps` | `1` | 每次 optimizer update 累积的 chunk 数；只有最后一个 micro-step 做 student DDP 同步 |
+| `micro_batch_size` | `1` | 每张卡每次 forward 的独立窗口数；`epoch` 模式可设为 2、4 等，实际最后一组可能较小。每步有效 token 数约为 `micro_batch_size × chunk_tokens × grad_accum_steps × GPU 数` |
+
+仓库中的 `configs/train.json` 为本机 96 GB RTX PRO 6000 配置了 `micro_batch_size: 8`。训练入口默认启用 PyTorch 的 `expandable_segments` 缓存分配器，以减少长上下文 KV cache 扩容时的显存碎片；已设置 `PYTORCH_ALLOC_CONF` 的启动环境会覆盖此默认值。在第 16 阶段、完整 16K 上下文的模拟中，batch 8 持续达到约 600 W，中段约 4496 token/s，末尾一次反向的 CUDA 峰值保留约 65.6 GB；batch 24 的中段约 4173 token/s，峰值保留约 86.7 GB。因此本机示例按吞吐选择 batch 8。该模拟使用同形状替换层权重和合成 token，不代表真实语料上的最终吞吐；实际运行请以训练日志的有效 token 吞吐选择批量大小。修改 batch 大小时，阶段中途需开新运行；从已完成阶段的 checkpoint 可以按新 batch 大小继续下一阶段。
 | `training_mode` | `epoch` | 每阶段完整遍历全部 token；`sampled` 为旧的定步数采样模式 |
 | `stage_steps` | `1000` | 仅 sampled 模式生效，epoch 模式自动计算并忽略此值 |
 
@@ -292,7 +297,7 @@ torchrun --standalone --nproc_per_node=4 train.py --config configs/my_train.json
 
 rank 0 的 tqdm 每个 optimizer step 更新全局 `nmse`、`rrms`、`cosine`，并显示阶段、step/s 和 ETA；屏幕刷新最多约每 0.5 秒一次，其他 rank 不重复显示。恢复时从 checkpoint 的 step 开始。JSON 日志与 W&B 仍按 `log_interval` 写入，`TQDM_DISABLE=1` 可以关闭进度条。
 
-HF 5.17 且已安装 FLA 时，冻结前缀的 BF16、batch=1、长度不超过 512 的 GDN 使用 HF 的 fused recurrent 内核分发，包含 512 token 的完整 chunk 和 257～511 token 的短尾；较长序列、CPU 与需要梯度的运算仍使用原 chunk 路径。这减少新序列长度触发的 Triton 编译和慢 rank 等待。计算顺序不同，允许 BF16 舍入差异；基座权重和数学递推不变。`THESEUS_GDN_KERNEL=chunk` 可回退到原内核作对照。更新后需要重启训练进程才能生效；可从已有 checkpoint 恢复，不需要重新转换数据。
+HF 5.17 且已安装 FLA 时，冻结前缀的 BF16、长度不超过 512 的 GDN 使用 HF 的 fused recurrent 内核分发，支持单样本和批量窗口，包含 512 token 的完整 chunk 和 257～511 token 的短尾；较长序列、CPU 与需要梯度的运算仍使用原 chunk 路径。这减少新序列长度触发的 Triton 编译和慢 rank 等待。计算顺序不同，允许 BF16 舍入差异；基座权重和数学递推不变。`THESEUS_GDN_KERNEL=chunk` 可回退到原内核作对照。更新后需要重启训练进程才能生效；可从已有 checkpoint 恢复，不需要重新转换数据。
 
 训练在目标 attention 输出处通过临时 hook 返回，不再执行该 block 的 residual/FFN、后续 block 或最终 norm。完整验证仍执行所有层。CUDA AdamW 使用 fused 更新；全 rank 的指标归约不再在前后额外执行 device-wide synchronize。
 
@@ -337,7 +342,7 @@ bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
 ## 训练语义
 
 - 第 s 阶段 teacher 是前 s−1 个替换已完成的模型；只新增第 s 个替换。
-- 每个 rank 使用原 TokenStream 读取自己的数据；在卡内共享同一个隐藏输入，保证两个分支按 token 位置对齐。
+- 每个 rank 读取自己的窗口；`micro_batch_size > 1` 时将等长窗口组成独立 batch lane。在卡内 teacher 和 student 共享同一个隐藏输入，保证按 token 位置对齐。
 - 捕获点在 input norm 之后、attention residual 之前；包括 teacher attention 自身 gate/o_proj。
 - 训练时 HF 原生 forward 只运行到目标 decoder 层，原 FullAttention 产生目标，新 TimeMix 独立建图；不执行后续 decoder 层。完整 student forward 只用于验证。
 - BF16 forward；当前新层保留 FP32 参数、梯度和 AdamW 一二阶状态；loss 和 WKV state 为 FP32。阶段完成后该层转为冻结 BF16 权重，广播给所有 rank。

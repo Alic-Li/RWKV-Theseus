@@ -4,16 +4,22 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
-from .data import TokenStream, EpochTokenStream
+from .data import TokenStream, EpochTokenStream, BatchedEpochTokenStream
 from .hf_model import AttentionAdapter, Capture, isolated_state
 from .losses import statistics, metrics, kl_sum
 from .timemix import detach_state
 
 
 def reader_for(cfg, topo, validation=False):
-    reader_class = EpochTokenStream if not validation and cfg.get("training_mode", "sampled") == "epoch" else TokenStream
+    if validation or cfg.get("training_mode", "sampled") != "epoch":
+        reader_class = TokenStream
+    elif cfg.get("micro_batch_size", 1) > 1:
+        reader_class = BatchedEpochTokenStream
+    else:
+        reader_class = EpochTokenStream
     return reader_class(cfg["validation_manifest" if validation else "train_manifest"],
-                       topo.rank, topo.world, cfg["chunk_tokens"], cfg["context_tokens"], cfg["seed"])
+                       topo.rank, topo.world, cfg["chunk_tokens"], cfg["context_tokens"], cfg["seed"],
+                       **({"micro_batch_size": cfg["micro_batch_size"]} if reader_class is BatchedEpochTokenStream else {}))
 
 
 @contextmanager

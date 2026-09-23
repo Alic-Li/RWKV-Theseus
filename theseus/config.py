@@ -8,6 +8,7 @@ DEFAULTS = {
     "chunk_tokens": 256, "context_tokens": 4096, "stage_steps": 1000, "training_mode": "epoch",
     "lr": 1e-4, "betas": [0.9, 0.999], "adam_eps": 1e-8, "weight_decay": 0.01,
     "clip_norm": 1.0, "warmup_steps": 300, "constant_steps": 3000, "min_lr": 3e-6, "grad_accum_steps": 1,
+    "micro_batch_size": 1,
     "cosine_weight": 0.0, "loss_epsilon": 1e-6, "checkpoint_interval": 3000,
     "validation_interval": 100, "validation_chunks": 8, "log_interval": 10,
     "original_teacher_kl": False, "kl_token_block": 16, "debug_input": False,
@@ -23,14 +24,16 @@ def load_config(path):
     if unknown:
         raise ValueError(f"Unknown config keys: {unknown}")
     cfg = DEFAULTS | supplied
-    for name in ("chunk_tokens", "context_tokens", "grad_accum_steps", "validation_chunks",
+    for name in ("chunk_tokens", "context_tokens", "grad_accum_steps", "micro_batch_size", "validation_chunks",
                  "expected_attention_layers", "head_size", "kl_token_block", "log_interval"):
-        if cfg[name] <= 0:
-            raise ValueError(f"{name} must be positive")
+        if type(cfg[name]) is not int or cfg[name] <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     if cfg["context_tokens"] < cfg["chunk_tokens"]:
         raise ValueError("context_tokens must be >= chunk_tokens")
     if cfg["training_mode"] not in ("epoch", "sampled"):
         raise ValueError("training_mode must be epoch or sampled")
+    if cfg["micro_batch_size"] > 1 and cfg["training_mode"] != "epoch":
+        raise ValueError("micro_batch_size > 1 currently requires training_mode=epoch")
     if cfg["training_mode"] == "sampled":
         steps = cfg["stage_steps"] if isinstance(cfg["stage_steps"], list) else [cfg["stage_steps"]]
         if len(steps) not in (1, cfg["expected_attention_layers"]) or min(steps) < 1:

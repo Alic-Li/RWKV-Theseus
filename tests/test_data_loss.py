@@ -76,3 +76,28 @@ def test_epoch_all_tokens_once_with_tails_and_resume(tmp_path):
             seen.extend(batch['ids'].flatten().tolist())
         assert reader.state_dict() == resumed.state_dict()
     assert sorted(seen) == list(range(37))
+
+
+def test_batched_epoch_lanes_cover_tokens_and_resume(tmp_path):
+    from theseus.data import BatchedEpochTokenStream
+    manifest = write_dataset(tmp_path)
+    seen = []
+    for rank in range(2):
+        reader = BatchedEpochTokenStream(manifest, rank, 2, 3, 7, micro_batch_size=2)
+        assert reader.rank_chunks[rank] == sum(1 for group in reader.groups
+                                               for _ in range(0, int(group[0, 2] - group[0, 1]), 3))
+        first = reader.next()
+        if first:
+            seen.extend(first["ids"].flatten().tolist())
+        resumed = BatchedEpochTokenStream(manifest, rank, 2, 3, 7, micro_batch_size=2)
+        resumed.load_state_dict(reader.state_dict())
+        while True:
+            batch, other = reader.next(), resumed.next()
+            assert (batch is None) == (other is None)
+            if batch is None:
+                break
+            torch.testing.assert_close(batch["ids"], other["ids"])
+            assert batch["position"] == other["position"]
+            seen.extend(batch["ids"].flatten().tolist())
+        assert reader.state_dict() == resumed.state_dict()
+    assert sorted(seen) == list(range(37))
