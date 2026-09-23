@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwkv-theseus"
+version = "0.1.0"
+description = "Progressive Qwen full-attention to stateful RWKV7 distillation"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.10,<2.15", "transformers>=5.8,<5.18", "numpy>=1.26", "safetensors>=0.4", "ninja>=1.11", "tqdm>=4.66"]
+
+[project.optional-dependencies]
+tracking = ["wandb>=0.19"]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["theseus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["cuda: requires CUDA and nvcc", "multi_gpu: requires at least two physical GPUs"]
+
+[[tool.uv.index]]
+name = "ustc"
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true

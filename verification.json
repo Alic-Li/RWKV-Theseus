@@ -1,0 +1,82 @@
+{
+  "environment": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell 96GB",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.8.0",
+    "cuda_toolkit": "13.3",
+    "host_compiler": "GCC 15"
+  },
+  "tests": "32 passed, 1 skipped in 36.88s",
+  "single_gpu_27b_probe": [
+    {
+      "loaded": true,
+      "order": [
+        63,
+        59,
+        55,
+        51,
+        47,
+        43,
+        39,
+        35,
+        31,
+        27,
+        23,
+        19,
+        15,
+        11,
+        7,
+        3
+      ],
+      "allocated_gb": 53.794147328
+    },
+    {
+      "chunk_equivalence": {
+        "nmse": 0.00022034843277651817,
+        "rrms": 0.014844137993717189,
+        "cosine": 0.9998908042907715,
+        "tokens": 16
+      }
+    },
+    {
+      "backward": {
+        "nmse": 1.0,
+        "rrms": 1.0,
+        "cosine": 0.0,
+        "tokens": 16
+      },
+      "trainable_tensors": 23,
+      "peak_allocated_gb": 54.693280768
+    }
+  ],
+  "not_verified": [
+    "eight-GPU and multi-node NCCL",
+    "full 27B sixteen-stage training",
+    "long-context throughput and convergence"
+  ],
+  "total_passed": 32,
+  "total_skipped": 1,
+  "skip_reason": "Real NCCL hardware test requires at least two physical GPUs",
+  "nccl_review": "NCCL_REVIEW.md",
+  "single_gpu_27b_probe_note": "Prior single-GPU probe retained; not rerun for data/communication changes",
+  "cloud_shared_environment": {
+    "python": "/home/rwkv/alic-li/python_env/py312/bin/python",
+    "index": "https://mirrors.ustc.edu.cn/pypi/simple",
+    "torch": "2.14.0+cu130",
+    "transformers": "5.17.0",
+    "nccl": "2.30.7",
+    "physical_gpus": [
+      0,
+      1,
+      3,
+      4
+    ],
+    "cpu_tests": "26 passed, 7 GPU tests skipped",
+    "cuda_tests": "6 passed",
+    "four_gpu_nccl": "passed, two stages",
+    "tiny_hf": "all 16 stages passed",
+    "27b": "save/restart/resume/stage transition passed; 3 optimizer updates total",
+    "exit_code": 0,
+    "latest_checkpoint": "/home/rwkv/alic-li/RWKV-Theseus/runs/cloud_smoke_shared/stage_02_step_00000001"
+  }
+}
