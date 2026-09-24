@@ -41,7 +41,7 @@ def make_config(tmp_path, stages):
     return cfg, path
 
 
-def test_midstream_and_stage_commit_resume(tmp_path):
+def test_parallel_midstream_and_complete_resume(tmp_path):
     cfg, path = make_config(tmp_path, 2)
     cfg.update(warmup_steps=1, constant_steps=0)
     path.write_text(json.dumps(cfg))
@@ -51,8 +51,10 @@ def test_midstream_and_stage_commit_resume(tmp_path):
     launch(path, extra=("--stop-after", "1"))
     launch(path, extra=("--resume", str(tmp_path / "resumed"), "--stop-after", "2"))
     _, mid, _ = read_checkpoint(tmp_path / "resumed")
-    assert mid["stage"] == 0 and mid["complete"]
-    # Resume exactly between stage commit and promotion.
+    assert mid["step"] == 3 and mid["complete"]
+    # Simulate interruption after final delta commit but before full export.
+    import shutil
+    shutil.rmtree(tmp_path / "resumed" / "converted")
     launch(path, extra=("--resume", str(tmp_path / "resumed")))
     af, _, _ = read_checkpoint(tmp_path / "full")
     bf, _, _ = read_checkpoint(tmp_path / "resumed")
@@ -83,17 +85,30 @@ def test_four_rank_all_sixteen_stages_and_export(tmp_path):
     path.write_text(json.dumps(cfg))
     launch(path, ranks=4)
     checkpoint, meta, delta = read_checkpoint(tmp_path / "full")
-    assert meta["complete"] and meta["stage"] == 15 and len(delta) == 16
+    assert meta["complete"] and meta["training_topology"] == "parallel_layers_v1" and len(delta) == 16
     assert meta["order"] == list(range(1, 32, 2))
     out = tmp_path / "export"
     subprocess.run([sys.executable, str(ROOT / "export.py"), "--checkpoint", str(checkpoint), "--output", str(out)],
                    check=True, capture_output=True, timeout=30)
     from theseus.inference import load_export
+    # Full export must load without access to the original base directory.
+    (tmp_path / "base").rename(tmp_path / "base_hidden")
     runner = load_export(out, device="cpu")
+    assert (out / "model.safetensors").exists()
+    assert not (out / "migrated.safetensors").exists()
+    assert all(not p.name.startswith("model") for p in checkpoint.iterdir())
+    opt = torch.load(checkpoint / "optimizer.pt", weights_only=False)
+    assert set(opt) == set(meta["order"])
     for _ in range(2):
         hidden = runner.forward(torch.tensor([[1, 2, 3]]))
         assert torch.isfinite(hidden).all()
     assert runner.cache.cursor == 6
+    from theseus.hf_model import load_model
+    base = load_model(tmp_path / "base_hidden", "cpu")
+    actual = runner.model.state_dict()
+    for name, value in base.state_dict().items():
+        if not any(name.startswith(f"model.layers.{layer}.self_attn.") for layer in meta["order"]):
+            torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
 
 
 def test_single_rank_local_training(tmp_path):
@@ -102,11 +117,11 @@ def test_single_rank_local_training(tmp_path):
     cfg["validation_interval"] = 1
     path.write_text(json.dumps(cfg))
     result = launch(path, ranks=1)
-    assert "Stage 1/1" in result.stderr
-    for metric in ("nmse=", "rrms=", "cosine="):
+    assert "Parallel migration (1 layers)" in result.stderr
+    for metric in ("sum_loss=", "mean_cos="):
         assert metric in result.stderr
     _, meta, delta = read_checkpoint(tmp_path / "full")
-    assert meta["world"] == 1 and meta["training_topology"] == "local_branch_v1"
+    assert meta["world"] == 1 and meta["training_topology"] == "parallel_layers_v1"
     assert meta["complete"] and len(delta) == 1
 
 

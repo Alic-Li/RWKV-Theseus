@@ -1,8 +1,8 @@
 # RWKV-Theseus
 
-RWKV-Theseus 是一个基于原生 PyTorch 的实验性训练框架，用于将 Qwen3.8-27B 中的 16 个 Full Attention 层逐层迁移为 RWKV7 TimeMix。模型加载与冻结前缀计算直接使用 Hugging Face 实现；每个阶段仅训练当前新增的 TimeMix 层。项目不依赖 Lightning、DeepSpeed、Accelerate、Trainer、张量并行或流水线并行。
+RWKV-Theseus 使用 Parallel Layer Migration，将 Qwen3.8-27B 中的 16 个 Full Attention 层独立迁移为 RWKV7 TimeMix。每个 batch 只运行一次完整冻结原始 Qwen，捕获全部层的 detached input/target，随后逐层独立反向、裁剪和更新。项目不依赖 Lightning、DeepSpeed、Accelerate、Trainer、张量并行或流水线并行。
 
-对于当前 Qwen3.8-27B 权重，模型包含 64 个 decoder block，其中 16 个为 Full Attention，迁移顺序为 `3, 7, ..., 63`；其余 48 个 Gated DeltaNet 层保持不变。训练阶段只执行目标层之前的冻结前缀和目标 Attention/TimeMix 分支，不执行目标 block 的 FFN 及其后的 decoder block。详细设计参见 [架构说明](ARCHITECTURE_zh.md)，验证信息保存在仓库的测试和 `verification.json` 中。
+对于当前 Qwen3.8-27B 权重，模型包含 64 个 decoder block，其中 16 个为 Full Attention，迁移顺序为 `3, 7, ..., 63`；其余 48 个 Gated DeltaNet 层保持不变。训练期间不把任何 TimeMix 装入 teacher；完整 assembled model 仅在全部训练完成后组装、验证和导出。详细设计参见 [架构说明](ARCHITECTURE_zh.md)，验证信息保存在仓库的测试和 `verification.json` 中。
 
 本项目面向研究和工程验证，当前接口、性能和 checkpoint 格式可能随实验迭代调整。
 
@@ -138,17 +138,17 @@ data/
 
 训练启动前会完整校验 manifest 引用文件的 SHA256。训练期间通过只读 NumPy memmap 按需读取数据，不会将全部 token 加载到内存。
 
-### 每阶段完整遍历与状态
+### 并行迁移的完整遍历与状态
 
-默认 `training_mode: "epoch"`：每个 stage 将训练 manifest 中所有 source 的全部 token 恰好训练一次，然后才进入下一层。不会按 source weight 有放回抽样；weight 只在旧 `sampled` 模式生效。无需重新转换数据。
+默认 `training_mode: "epoch"`：所有层共享一次训练 manifest 的完整遍历，每个 token 同时为全部层提供训练样本。不会按 source weight 有放回抽样；weight 只在旧 `sampled` 模式生效。无需重新转换数据。
 
-每篇文档从头到尾切为最多 `context_tokens` 的窗口，窗口再切为最多 `chunk_tokens` 的连续 chunk，所有短尾保留，不 padding、不跨文档。窗口按 seed 确定性打乱并分配给不同 rank；每个 stage 重放相同完整遍历顺序。窗口内保留 recurrent/cache 状态，窗口切换 reset。
+每篇文档从头到尾切为最多 `context_tokens` 的窗口，窗口再切为最多 `chunk_tokens` 的连续 chunk，所有短尾保留，不 padding、不跨文档。窗口按 seed 确定性打乱并分配给不同 rank；全部层共享同一遍历顺序。窗口内保留 recurrent/cache 状态，窗口切换 reset。
 
 `micro_batch_size > 1` 时，每个 rank 将等长窗口打包成一个 batch，窗口各占一条独立 lane。整组窗口从位置零同步前进，组结束后一起重置 cache 和 TimeMix state。短尾按实际长度分组，最后不足一个 batch 的组直接以较小 batch 运行；所有 token 仍只遍历一次。为了保持独立上下文和避免 padding，打包会改变原先单样本窗口的处理顺序。此模式目前用于 `epoch`，`sampled` 模式保持单样本。
 
-step 数由完整遍历的实际 chunk 数、world size、梯度累积次数计算；epoch 模式忽略 `stage_steps`。tqdm 总数是本阶段实际 optimizer step 数。先耗尽的 rank 通过零损失 dummy 保持 DDP 同步，不增加有效 token，也不更新自己的 recurrent state。最终不完整的累积批次按实际有效 token 归一化。
+step 数由完整遍历的实际 chunk 数、world size、梯度累积次数计算；epoch 模式忽略 `stage_steps`。tqdm 总数是全部层共同的 optimizer step 数。先耗尽的 rank 通过零损失 dummy 保持 DDP 同步，不增加有效 token，也不更新自己的 recurrent state。最终不完整的累积批次按实际有效 token 归一化。
 
-每 3000 个 optimizer step 保存 checkpoint，阶段结束额外保存 complete checkpoint。中途恢复保存每 rank 的窗口编号、chunk offset、已消费 token 数和模型状态。旧 sampled 模式 checkpoint 不能直接作为 epoch 游标恢复；默认配置使用新的 `runs/theseus_shallow_to_deep`，旧 runs 保留。
+每 3000 个 optimizer step 保存 checkpoint，训练结束额外保存 complete checkpoint。中途恢复保存每 rank 的窗口编号、chunk offset、已消费 token 数和模型状态。旧 sampled 模式 checkpoint 不能直接作为 epoch 游标恢复；默认配置使用新的 `runs/theseus_parallel`，旧 runs 保留。
 
 `training_mode: "sampled"` 仅供旧行为/短测试使用，此时 `stage_steps` 控制采样训练步数。
 
@@ -175,9 +175,9 @@ torchrun --standalone --nproc_per_node=4 scripts/check_nccl.py
 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS=4 bash scripts/torchrun.sh
 ```
 
-每张 GPU 都运行一份冻结模型和一个当前可训练 TimeMix。冻结前缀只计算一次，当前 FullAttention 和 TimeMix 共享输入；只有 TimeMix 参与所有 rank 的 DDP。支持 1、2、3、4、8 等 GPU 数，不再区分 teacher/student 卡。四卡每步有四份独立样本，旧架构只有两份；相同步数下有效 token 预算随之增加。
+每张 GPU 运行一份原始冻结 Qwen 和全部独立 TMix。每个微批次只执行一次 teacher forward，各层 TMix 各自参与所有 rank 的 DDP。支持 1、2、3、4、8 等 GPU 数；各 rank 读取独立样本。
 
-默认每个 stage 完整遍历训练集一次；16 个 stage 会在同一个命令中从浅到深连续运行，无需手动逐阶段启动。每阶段结束后，框架执行验证、保存 complete checkpoint、冻结当前 TimeMix、广播权重并自动进入下一阶段。
+默认完整遍历训练集一次，同时训练全部 16 层；每层有独立 AdamW、scheduler 和 recurrent state。完成后自动保存最终 delta checkpoint，重新加载原始 Qwen，一次性替换全部目标层，完成 composition validation 后导出到 `output/converted/`。
 
 先跑一个 optimizer update 的 smoke test：
 
@@ -186,18 +186,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS=4 \
 bash scripts/torchrun.sh --stop-after 1
 ```
 
-`--stop-after` 是本次进程累计执行的 optimizer update 数，只用于短测试。它会保存一个未完成阶段 checkpoint 后正常退出。
+`--stop-after` 是本次进程累计执行的 optimizer update 数，只用于短测试。它会保存一个未完成的 parallel checkpoint 后正常退出。
 
 中断或 smoke test 后恢复：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS=4 \
-bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
+bash scripts/torchrun.sh --resume runs/theseus_parallel/latest
 ```
 
-如果 output 中已经存在 `latest`，必须使用 `--resume` 或指定新的 output 目录；框架会拒绝直接覆盖已有运行。阶段中断恢复要求 world size 和 rank 到设备的映射保持不变；从阶段边界的 complete checkpoint 恢复时，可以更换拓扑并从该阶段的数据起点继续。
+如果 output 中已经存在 `latest`，必须使用 `--resume` 或指定新的 output 目录；框架会拒绝直接覆盖已有运行。中途恢复要求 world size 和 rank 到设备的映射保持不变；complete checkpoint 仅用于完成或读取最终导出，不会再开始新的训练阶段。
 
-所有进程由同一个 torchrun 启动。Gloo world group 用于配置检查、checkpoint 和阶段广播；一个覆盖全部 rank 的 NCCL group 用于 TimeMix DDP。没有跨卡 token/hidden 传输，也没有配对 header/ACK。单卡也通过 `torchrun --nproc_per_node=1` 启动。
+所有进程由同一个 torchrun 启动。Gloo world group 用于配置检查、checkpoint 同步；一个覆盖全部 rank 的 NCCL group 用于 TimeMix DDP。没有跨卡 token/hidden 传输，也没有配对 header/ACK。单卡也通过 `torchrun --nproc_per_node=1` 启动。
 
 多节点需要每节点相同的 GPU 数，以及共享的模型、数据和 checkpoint 路径。例如每节点运行：
 
@@ -220,15 +220,15 @@ torchrun --nnodes=2 --node_rank="$NODE_RANK" --nproc_per_node=8 \
 | `model` | `../Qwen3.8-27B` | 本地 HF 基座目录；每个 rank 都加载一份完整文本模型 |
 | `train_manifest` | `data/train/manifest.json` | 训练 token manifest |
 | `validation_manifest` | `data/val/manifest.json` | 验证 token manifest |
-| `output` | `runs/theseus_shallow_to_deep` | 日志和 checkpoint 根目录；已有 `latest` 时必须恢复或更换目录 |
-| `expected_attention_layers` | `16` | 必须检测到的 full-attention 层数，也就是 stage 数 |
+| `output` | `runs/theseus_parallel` | 日志和 checkpoint 根目录；已有 `latest` 时必须恢复或更换目录 |
+| `expected_attention_layers` | `16` | 必须检测到的 full-attention 层数，独立 student 数 |
 | `head_size` | `64` | 新 TimeMix 的 head size；CUDA 后端允许 2–128，且必须整除 hidden size |
 | `backend` | `cuda` | TimeMix recurrence；正式训练用 `cuda`，`reference` 只用于 CPU 测试 |
 | `distributed_backend` | `nccl` | 正式多 GPU 用 `nccl`；`gloo` 只配合 CPU reference 测试 |
 | `seed` | `42` | 初始化和确定性数据窗口采样 seed |
 | `timeout_minutes` | `60` | torch.distributed process-group 超时 |
 
-序列和阶段：
+序列和训练步数：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
@@ -237,54 +237,50 @@ torchrun --nnodes=2 --node_rank="$NODE_RANK" --nproc_per_node=8 \
 | `grad_accum_steps` | `1` | 每次 optimizer update 累积的 chunk 数；只有最后一个 micro-step 做 student DDP 同步 |
 | `micro_batch_size` | `1` | 每张卡每次 forward 的独立窗口数；`epoch` 模式可设为 2、4 等，实际最后一组可能较小。每步有效 token 数约为 `micro_batch_size × chunk_tokens × grad_accum_steps × GPU 数` |
 
-仓库中的 `configs/train.json` 为本机 96 GB RTX PRO 6000 配置了 `micro_batch_size: 8`。训练入口默认启用 PyTorch 的 `expandable_segments` 缓存分配器，以减少长上下文 KV cache 扩容时的显存碎片；已设置 `PYTORCH_ALLOC_CONF` 的启动环境会覆盖此默认值。在第 16 阶段、完整 16K 上下文的模拟中，batch 8 持续达到约 600 W，中段约 4496 token/s，末尾一次反向的 CUDA 峰值保留约 65.6 GB；batch 24 的中段约 4173 token/s，峰值保留约 86.7 GB。因此本机示例按吞吐选择 batch 8。该模拟使用同形状替换层权重和合成 token，不代表真实语料上的最终吞吐；实际运行请以训练日志的有效 token 吞吐选择批量大小。修改 batch 大小时，阶段中途需开新运行；从已完成阶段的 checkpoint 可以按新 batch 大小继续下一阶段。
-| `training_mode` | `epoch` | 每阶段完整遍历全部 token；`sampled` 为旧的定步数采样模式 |
+示例使用 `micro_batch_size: 8`。并行迁移同时保留 16 层 FP32 参数和 Adam 状态，显存需求与旧逐阶段实现不同；请按实际设备选择 batch/context。
+
+| `training_mode` | `epoch` | 所有层共享一次完整 token 遍历；`sampled` 为旧的定步数采样模式 |
 | `stage_steps` | `1000` | 仅 sampled 模式生效，epoch 模式自动计算并忽略此值 |
 
-仅 sampled 模式的 `stage_steps` 数组示例：
+`stage_steps` 保留旧字段名，表示所有层共同的更新次数；数组形式仅接受各项相等。
 
-```json
-"stage_steps": [1000, 1000, 1200, 1200, 1500, 1500, 1800, 1800,
-                2000, 2000, 2500, 2500, 3000, 3000, 4000, 4000]
-```
-
-一个 update 的标称 token 数约为 `GPU 数 × grad_accum_steps × chunk_tokens`；document 尾块可能更短，因此框架最终按所有 student 的实际有效 token 数归一化梯度。`context_tokens` 控制状态连续范围，`chunk_tokens` 控制单次反向显存，两者含义不同。
+一个 update 的标称 token 数约为 `GPU 数 × micro_batch_size × grad_accum_steps × chunk_tokens`；document 尾块可能更短，因此框架最终按所有 student 的实际有效 token 数归一化梯度。`context_tokens` 控制状态连续范围，`chunk_tokens` 控制单次反向显存，两者含义不同。
 
 优化器和损失：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `lr` | `1e-4` | 当前 stage 新 TimeMix 的 AdamW 学习率 |
+| `lr` | `1e-4` | 每层 TimeMix 的 AdamW 学习率 |
 | `betas` | `[0.9, 0.999]` | AdamW beta1/beta2 |
 | `adam_eps` | `1e-8` | AdamW epsilon |
 | `weight_decay` | `0.01` | 仅用于二维、名称以 `.weight` 结尾的矩阵；norm、bias 和 mixing 参数不衰减 |
-| `warmup_steps` | `300` | 每个 stage 的线性 warmup 更新次数；`0` 表示关闭 |
+| `warmup_steps` | `300` | 每层独立的线性 warmup 更新次数；`0` 表示关闭 |
 | `constant_steps` | `3000` | warmup 后保持峰值 `lr` 的更新次数 |
 | `min_lr` | `3e-6` | cosine 衰减终点学习率 |
-| `clip_norm` | `1.0` | 全局梯度范数裁剪阈值；W&B/日志记录裁剪前范数 |
-| `cosine_weight` | `0.0` | 总损失中 `1-cosine` 的权重；设为 `0.05` 可启用需求中的可选项 |
+| `clip_norm` | `1.0` | 每层梯度范数裁剪阈值；W&B/日志记录裁剪前范数 |
+| `cosine_weight` | `0.0` | 兼容字段，必须为 0；只优化 NMSE |
 | `loss_epsilon` | `1e-6` | NMSE 分母下限，防止 teacher 能量接近零时数值爆炸 |
 
 主损失按 token 计算：
 
 ```text
 NMSE = mean((student - teacher)^2) / max(mean(teacher^2), loss_epsilon)
-loss = NMSE + cosine_weight * (1 - cosine_similarity)
+loss_i = mean_token(NMSE_i)
 ```
 
 保存、日志和验证：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `log_interval` | `10` | 每多少 optimizer step 输出训练指标；每阶段第 1 步固定记录 |
-| `checkpoint_interval` | `3000` | 阶段内保存间隔；`0` 关闭定期保存，但阶段结束仍保存 |
-| `validation_interval` | `100` | 阶段内验证间隔；`0` 关闭定期验证，但阶段结束仍验证 |
+| `log_interval` | `10` | 每多少 optimizer step 输出训练指标；第 1 步固定记录 |
+| `checkpoint_interval` | `3000` | 训练保存间隔；`0` 关闭定期保存，但训练结束仍保存 |
+| `validation_interval` | `100` | 训练验证间隔；`0` 关闭定期验证，但训练结束仍验证 |
 | `validation_chunks` | `8` | 每次验证消费的 chunk 数，不是 document 数 |
-| `original_teacher_kl` | `false` | 是否额外计算原始未迁移 M0 对完整 student 的最终 logits KL；开销较大 |
+| `original_teacher_kl` | `false` | 仅最终组装验证时计算原始 M0 对完整 student 的 logits KL；开销较大 |
 | `kl_token_block` | `16` | 计算 logits KL 时 lm_head 的 token 分块大小，用于限制峰值显存 |
-| `debug_input` | `false` | 验证时检查 student 输入与本地 teacher 捕获输入是否接近 |
+| `debug_input` | `false` | 保留兼容；parallel 模式直接使用 detached teacher 捕获输入 |
 
-W&B 字段 `wandb_mode`、`wandb_project`、`wandb_entity`、`wandb_name` 见下一节。修改 `output`、日志/保存/验证间隔、超时和 W&B 字段可以恢复；其他会改变训练语义的字段在阶段中恢复时必须与 checkpoint 一致。
+W&B 字段 `wandb_mode`、`wandb_project`、`wandb_entity`、`wandb_name` 见下一节。修改 `output`、日志/保存/验证间隔、超时和 W&B 字段可以恢复；其他会改变训练语义的字段在中途恢复时必须与 checkpoint 一致。
 
 如果要使用另一份配置文件，不经过固定为 `configs/train.json` 的辅助脚本，可直接执行：
 
@@ -295,22 +291,11 @@ torchrun --standalone --nproc_per_node=4 train.py --config configs/my_train.json
 
 ## 进度条与多卡效率
 
-rank 0 的 tqdm 每个 optimizer step 更新全局 `nmse`、`rrms`、`cosine`，并显示阶段、step/s 和 ETA；屏幕刷新最多约每 0.5 秒一次，其他 rank 不重复显示。恢复时从 checkpoint 的 step 开始。JSON 日志与 W&B 仍按 `log_interval` 写入，`TQDM_DISABLE=1` 可以关闭进度条。
+rank 0 的 tqdm 每个 optimizer step 只展示 `sum_loss = Σ NMSE_i` 和 `mean_cos = mean(cos_i)` 两个训练指标，附带进度和 ETA；屏幕刷新最多约每 0.5 秒一次，其他 rank 不重复显示。恢复时从 checkpoint 的 step 开始。JSON 日志与 W&B 仍按 `log_interval` 写入，`TQDM_DISABLE=1` 可以关闭进度条。
 
 HF 5.17 且已安装 FLA 时，冻结前缀的 BF16、长度不超过 512 的 GDN 使用 HF 的 fused recurrent 内核分发，支持单样本和批量窗口，包含 512 token 的完整 chunk 和 257～511 token 的短尾；较长序列、CPU 与需要梯度的运算仍使用原 chunk 路径。这减少新序列长度触发的 Triton 编译和慢 rank 等待。计算顺序不同，允许 BF16 舍入差异；基座权重和数学递推不变。`THESEUS_GDN_KERNEL=chunk` 可回退到原内核作对照。更新后需要重启训练进程才能生效；可从已有 checkpoint 恢复，不需要重新转换数据。
 
-训练在目标 attention 输出处通过临时 hook 返回，不再执行该 block 的 residual/FFN、后续 block 或最终 norm。完整验证仍执行所有层。CUDA AdamW 使用 fused 更新；全 rank 的指标归约不再在前后额外执行 device-wide synchronize。
-
-不同 rank 的序列长度、上下文长度和窗口重置位置仍可不同。GPU 利用率包含 NCCL 等待，不能仅凭瞬时 100% 判断有效计算。需要定位时临时启用：
-
-```bash
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 GPUS=7 THESEUS_PROFILE=1 \
-bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
-```
-
-`rank_profile` 在日志 step 记录各 rank 的 teacher 耗时、token 长度、上下文位置与 reset 标记。该诊断会额外同步计时，正常训练保持默认关闭。启动命令中的七个设备代表七张卡。数据采样、文件和 manifest 不受上述优化影响。
-
-在 7 张 NVIDIA RTX PRO 6000 上进行的短程对照中，使用 `chunk_tokens=512`、`context_tokens=16384`、相同数据顺序和训练超参数时，优化后的冻结 GDN 路径显著减少了不同 rank 之间的等待。该结果仅用于说明实现方向，不代表所有硬件和完整训练阶段的固定加速比例。
+训练始终执行完整原始 Qwen forward，再逐层运行 TimeMix 和 fused AdamW。不同 rank 的序列长度、上下文长度和窗口重置位置可以不同；每层按全局有效 token 归一化。
 
 ## W&B 指标记录
 
@@ -327,50 +312,38 @@ bash scripts/torchrun.sh --resume runs/theseus_shallow_to_deep/latest
 
 在线模式先在已激活环境中运行 `wandb login`，或自行设置 `WANDB_API_KEY`；不要把 API key 写入训练配置。`wandb_entity` 可填个人/团队名称，null 使用账号默认值。无网络时设置 `wandb_mode: "offline"`，记录位于训练 output 下的 `wandb/`，之后可用 `wandb sync <offline-run目录>` 上传。`disabled` 不导入 W&B，不要求安装依赖。模式以训练配置为准。
 
-仅 rank 0 初始化 W&B，训练指标已在 student group 汇总，避免每张卡重复写 run。训练日志同时记录 `seconds_per_step` 和所有 rank 合计的 `tokens_per_second`。只主动记录以下标量：
+仅 rank 0 初始化 W&B。顶层仅记录 `sum_loss` 和 `mean_cos`；每层按实际 decoder 编号记录 `layer_03/nmse`、`layer_03/cosine`、`layer_03/rrms`、`layer_03/grad_norm`、`layer_03/lr`，共 16 组。横轴是 `progress/global_step`。验证指标使用 `val/` 前缀，同样分层。
 
-- `train/loss`：NMSE + cosine_weight × (1 − cosine)，以及 `train/nmse`、`train/cosine`。
-- `train/lr`、`train/grad_norm`（裁剪前梯度范数）。
-- `train/seconds_per_step`、`train/tokens_per_second`：日志区间平均耗时和所有 rank 的合计有效 token 吞吐。
-- `val/nmse`、`val/rrms`、`val/cosine`：实际 student forward 的验证结果；启用 KL 后再记录 `val/original_teacher_kl`。
-- `progress/stage`、`progress/stage_step`，图表横轴为跨阶段累计的 `progress/global_step`。
-
-训练日志遵循 `log_interval`（每阶段首步也记录），验证日志遵循原有验证频率。不记录参数/梯度直方图，不上传 checkpoint 或数据；完整 teacher-forced 等指标仍在 `metrics.jsonl`。W&B 初始化失败会报错，需离线时应显式选择 offline。
+日志遵循 `log_interval`（首步也记录），验证遵循 `validation_interval`。不上传 checkpoint 或数据。`metrics.jsonl` 同时保留全部分层结果。
 
 同一 output 内 `--resume` 在线恢复会读取 `wandb_run.json` 接续同一 run；变更 project/entity 或 output 会建立新记录。恢复较早 checkpoint 可能重复记录对应优化步数。offline 每次启动单独生成 run 文件，不承诺自动拼接。W&B 配置可在恢复时调整，不改变训练数据和模型恢复逻辑。
 
 ## 训练语义
 
-- 第 s 阶段 teacher 是前 s−1 个替换已完成的模型；只新增第 s 个替换。
-- 每个 rank 读取自己的窗口；`micro_batch_size > 1` 时将等长窗口组成独立 batch lane。在卡内 teacher 和 student 共享同一个隐藏输入，保证按 token 位置对齐。
-- 捕获点在 input norm 之后、attention residual 之前；包括 teacher attention 自身 gate/o_proj。
-- 训练时 HF 原生 forward 只运行到目标 decoder 层，原 FullAttention 产生目标，新 TimeMix 独立建图；不执行后续 decoder 层。完整 student forward 只用于验证。
-- BF16 forward；当前新层保留 FP32 参数、梯度和 AdamW 一二阶状态；loss 和 WKV state 为 FP32。阶段完成后该层转为冻结 BF16 权重，广播给所有 rank。
-- TimeMix 的 previous-input shift 与矩阵状态跨 chunk 连续；HF KV/GDN 状态也连续保留。每 chunk detach，不跨 chunk 回传梯度。
-- 上下文窗口结束统一重置所有状态，不无限增长 attention KV。
-- TimeMix 不使用跨层 v_first；使用原 block 深度的初始化，所需代码直接放在 `theseus/timemix.py`、`theseus/wkv7.py` 和 `kernels/`，来源 commit 与适配说明写在文件头；上游许可证保留在 [LICENSE-RWKV7](LICENSE-RWKV7)。
+- teacher 始终是完整的原始冻结 Qwen，每个微批次只 forward 一次；16 个捕获点都在 input norm 之后、attention residual 之前，input/target 全部 detach。
+- TMix 独立于 teacher 模型注册树。每层执行 forward → 独立 NMSE backward → 本层梯度裁剪 → 本层 optimizer/scheduler step；不会合并 16 层 loss backward。计算图在本层 backward 后释放。
+- `grad_accum_steps > 1` 时，每个微批次逐层 backward，只累计梯度，最后一个微批次逐层更新；不保留此前计算图。DDP 平均后按全局有效 token 数归一化，耗尽 rank 用零损失 dummy 保持 collective 顺序。
+- 每层拥有 FP32 参数、梯度、Adam 状态；BF16 forward、FP32 loss/recurrent state。TimeMix 和原始 HF cache 各自跨 chunk 延续，state 每块 detach，窗口切换一起 reset。
+- 每层独立采用 warmup → constant → cosine 学习率调度。epoch 模式共享一次完整数据遍历，sampled 模式共享 `stage_steps` 次更新。
+- 训练期间验证只计算原始 teacher input 上各个 TMix 的独立指标，不运行 assembled model。
 
-主损失为每 token 的 `mean((student-teacher)^2) / max(mean(teacher^2), epsilon)`，再对有效 token 平均；`cosine_weight=0.05` 可启用余弦损失。日志 RRMS 明确定义为 `sqrt(NMSE)`。
-
-配置支持 LR、betas、Adam eps、weight decay、clip、warmup、梯度累积、阶段步数和各类间隔。sampled 模式的 `stage_steps` 可为整数或 16 项数组；epoch 模式自动计算步数。调度每阶段重新开始：第 1～300 步线性 warmup 到 `1e-4`，第 301～3300 步保持 `1e-4`，第 3301 步到阶段最后一步按 cosine 衰减到 `3e-6`。epoch 模式使用完整数据遍历算出的实际阶段步数，不使用 `stage_steps=1000`。短测试阶段不足 3301 步时，只执行走到的 warmup/constant 部分，不压缩调度。步数均指 optimizer step。续训保留 Adam 状态和当前阶段 step；允许修改上述学习率配置，并按已完成 step 计算下一次更新的 LR，旧恒定学习率 checkpoint 也可采用新调度，不重新 warmup。`checkpoint_interval=0`/`validation_interval=0` 关闭中间定期操作，但每阶段末始终保存和验证。
+NMSE 是每 token 的 `mean((prediction-target)^2) / max(mean(target^2), epsilon)`，随后对全局有效 token 平均；RRMS 为 `sqrt(NMSE)`。cosine 仅用于监控。
 
 ## Checkpoint、验证与导出
 
-每次 checkpoint 含全部迁移层 delta、当前 optimizer/scheduler、每 rank RNG、数据 reader cursor、HF 缓存、TimeMix 状态和位置。只在完整 optimizer step、通信清空后保存。共享目录的所有 shard 写完后提交 `COMMITTED` 并原子更新 `latest`；未提交目录不参与恢复。
+中间 checkpoint 格式为 `format=2, training_topology=parallel_layers_v1`：`migrated.safetensors` 仅含全部 TMix 权重，`optimizer.pt` 按层保存独立 optimizer/scheduler，`ranks/` 保存各 rank 的 RNG、reader、原始 HF cache 和全部 TMix recurrent state。不会重复写入 Qwen/base 权重。只在所有层完成一次更新后原子提交 `COMMITTED` 和 `latest`。
 
-checkpoint 标记 `training_topology=local_branch_v1`。旧版配对训练的中途 checkpoint 会拒绝恢复；已完成阶段的 checkpoint 可用于开始下一阶段。
+中途精确恢复要求相同基座、数据和 rank 拓扑；旧 sequential/stage checkpoint 不能作为 parallel 训练的续训起点。允许修改输出、日志间隔和学习率配置，保留 Adam 动量及已完成步数。
 
-中途精确恢复要求相同配置、基座、数据和 rank 拓扑；允许调整输出路径和日志/保存/验证间隔。阶段边界可改变拓扑并从数据起点重放。基座指纹使用 config/index 内容哈希与权重分片大小/mtime；基座目录必须保持不变，这不等于全量权重内容哈希。不同 CUDA kernel/硬件不保证位级复现。
-
-验证隔离训练缓存和 reader，报告 teacher-forced 与实际 student forward 的 NMSE/RRMS/cosine。开启 `original_teacher_kl` 后，teacher 临时从磁盘恢复原 attention，计算固定原模型 M0 对完整 student 的 `KL(p_M0 || p_student)`，不额外驻留第二个完整模型。lm_head 按 `kl_token_block` 个 token 分块；词表较大，此验证很昂贵。
+全部训练完成后释放训练模型和优化器，重新加载原始 Qwen，仅一次性替换指定层，其他权重不变。最终执行 composition validation（包括有限值检查；`original_teacher_kl` 开启时计算原模型 KL），然后只导出一份完整模型到 `output/converted/`。中途 standalone validation 仍是独立层验证，完成后的 standalone validation 才验证组装模型。
 
 ```bash
 torchrun --standalone --nproc_per_node=2 validate.py \
-  --config configs/train.json --checkpoint runs/theseus_shallow_to_deep/latest
-python export.py --checkpoint runs/theseus_shallow_to_deep/latest --output runs/export
+  --config configs/train.json --checkpoint runs/theseus_parallel/latest
+python export.py --checkpoint runs/theseus_parallel/latest --output runs/export
 ```
 
-只有全部阶段完成后才能最终导出。导出包含 `theseus.json` 和 `migrated.safetensors`，依赖不可变 HF 基座及本项目 loader：
+只有全部层训练完成后才能最终导出。训练入口自动导出；`export.py` 用于另行指定最终输出路径。完整导出包含 `config.json`、`theseus.json`、完整模型 safetensors 分片及可用的 tokenizer 文件；通过本项目 loader 直接加载，不再依赖原始 Qwen 目录：
 
 ```python
 import torch
@@ -438,8 +411,8 @@ python tests/make_fixture.py /tmp/theseus-demo --stages 16
 torchrun --standalone --nproc_per_node=4 train.py --config /tmp/theseus-demo/config.json
 ```
 
-测试覆盖非零初态、CUDA 前后向、短尾、current stream、整段/分块对齐、FP32 优化器、冻结边界、缓存恢复、DDP 加权梯度、中途/阶段边界恢复、全部 16 阶段和导出加载。
+测试覆盖非零初态、CUDA 前后向、短尾、current stream、整段/分块对齐、FP32 优化器、冻结边界、缓存恢复、DDP 加权梯度、中途/最终提交后恢复、全部 16 层和导出加载。
 
 当前 CUDA 代码是便于检查的基线：训练保存每个 timestep 的 FP32 state，显存约 `4*B*H*(T+1)*N*N` 字节；5120 宽、64 head size、256 token 时约 337 MB。反向用原子归约，未做上游 fused kernels 的性能优化；冻结推理不保存该历史。GDN 可使用 HF 原生 PyTorch fallback，长序列/27B 正式训练吞吐仍需实际多卡测量。
 
-由浅入深训练使用新输出目录 `runs/theseus_shallow_to_deep`。此前由深到浅的 checkpoint 迁移顺序不同，不能续训到新流程；请不带 `--resume` 启动新训练。旧 runs 和 data 保留不动。
+由浅入深训练使用新输出目录 `runs/theseus_parallel`。此前由深到浅的 checkpoint 迁移顺序不同，不能续训到新流程；请不带 `--resume` 启动新训练。旧 runs 和 data 保留不动。

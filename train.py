@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""One local teacher branch and DDP TimeMix per torchrun rank."""
+"""Immutable local Qwen teacher and independent per-layer DDP TimeMix students."""
 import argparse
 from contextlib import nullcontext
 import json
 import random
-import time
 import warnings
 import os
 from pathlib import Path
@@ -28,12 +27,12 @@ import numpy as np
 import torch
 from theseus.config import load_config, steps_for
 from theseus.distributed import Topology
-from theseus.hf_model import load_model, migration_order, install, Runner, Capture
-from theseus.stage import prepare_student, promote, lr_factor
-from theseus.losses import statistics, loss_sum, metrics
+from theseus.hf_model import load_model, migration_order, install, Runner, Capture, _state_to_device
+from theseus.stage import prepare_student, lr_factor
+from theseus.losses import statistics, metrics
 from theseus.checkpoint import (read_checkpoint, save_checkpoint, validate_resume,
-                                restore_rng, model_fingerprint)
-from theseus.validation import validate, reader_for
+                                restore_rng, model_fingerprint, cpu_tree)
+from theseus.validation import (reader_for, validate_parallel, validate_composition, summarize_layers)
 from theseus.tracking import Tracker
 from theseus.timemix import detach_state
 
@@ -95,176 +94,169 @@ def _run(cfg, resume, stop_after, tracker):
             if not token_file.exists() or digest_file(token_file) != expected:
                 raise ValueError(f"Dataset/model tokenizer differs: {name}")
     order = migration_order(model, cfg["expected_attention_layers"])
+    if cfg["cosine_weight"] != 0:
+        raise ValueError("Parallel migration requires cosine_weight=0")
     meta = None
     delta = {}
     checkpoint = None
-    start_stage = 0
     if resume:
         checkpoint, meta, delta = read_checkpoint(resume)
+        if meta.get("training_topology") != "parallel_layers_v1":
+            raise ValueError("Sequential checkpoints cannot resume parallel migration; start a new run")
         validate_resume(meta, cfg, topo, base_id, order)
-        start_stage = meta["stage"] + int(meta["complete"])
-        for layer in order[:start_stage]:
-            install(model, layer, cfg, delta[layer], trainable=False)
+        if set(delta) != set(order):
+            raise ValueError("Checkpoint must contain every migration layer")
+    export_meta = Path(cfg["output"]) / "converted" / "theseus.json"
+    if meta and meta["complete"] and export_meta.exists():
+        from theseus.data import digest_file
+        exported = json.loads(export_meta.read_text())
+        if (exported.get("migration_fingerprint") != digest_file(checkpoint / "migrated.safetensors")
+                or exported.get("base_fingerprint") != base_id):
+            raise ValueError("Existing converted model differs from resumed checkpoint; choose a new output")
+        topo.close()
+        return
+    saved = checkpoint
     tracker.start(cfg, topo, resume=bool(resume))
     runner = Runner(model)
-    total_updates = 0
-    for stage in range(start_stage, len(order)):
-        layer = order[stage]
-        continuing = meta is not None and not meta["complete"] and stage == meta["stage"]
-        step0 = meta["step"] if continuing else 0
-        # Same deterministic initialization regardless of whether earlier stages were resumed.
-        torch.manual_seed(cfg["seed"] + stage)
-        adapter = ddp = optimizer = scheduler = capture = None
-        reader = reader_for(cfg, topo)
-        max_steps = ((max(reader.rank_chunks) + cfg["grad_accum_steps"] - 1) // cfg["grad_accum_steps"]
-                     if cfg["training_mode"] == "epoch" else steps_for(cfg, stage))
-        adapter, ddp, optimizer, scheduler = prepare_student(
-            model, layer, cfg, topo, delta[layer] if continuing else None, total_steps=max_steps)
-        capture = Capture(adapter.teacher)
-        runner.reset()
-        if continuing:
-            local = torch.load(checkpoint / "ranks" / f"rank_{topo.rank:05d}.pt", map_location="cpu", weights_only=False)
-            runner.load_state_dict(local["runner"])
-            if reader:
-                reader.load_state_dict(local["reader"])
-            opt = torch.load(checkpoint / "optimizer.pt", map_location=topo.device, weights_only=False)
-            optimizer.load_state_dict(opt["optimizer"])
-            scheduler.load_state_dict(opt["scheduler"])
-            # Recompute the next update's LR with the current schedule. This
-            # also lets old constant-LR checkpoints adopt the new schedule
-            # without resetting Adam moments or restarting warmup.
-            next_lrs = [cfg["lr"] * lr_factor(step0, cfg, max_steps)] * len(optimizer.param_groups)
-            scheduler.base_lrs = [cfg["lr"]] * len(optimizer.param_groups)
+    reader = reader_for(cfg, topo)
+    max_steps = ((max(reader.rank_chunks) + cfg["grad_accum_steps"] - 1) // cfg["grad_accum_steps"]
+                 if cfg["training_mode"] == "epoch" else steps_for(cfg, 0))
+    step0 = meta["step"] if meta else 0
+    students, captures = {}, {}
+    for index, layer in enumerate(order):
+        torch.manual_seed(cfg["seed"] + index)
+        students[layer] = prepare_student(model, layer, cfg, topo, delta.get(layer),
+                                          total_steps=max_steps, detached=True)
+        captures[layer] = Capture(model.model.layers[layer].self_attn)
+    if meta and not meta["complete"]:
+        local = torch.load(checkpoint / "ranks" / f"rank_{topo.rank:05d}.pt", map_location="cpu", weights_only=False)
+        runner.load_state_dict(local["runner"])
+        reader.load_state_dict(local["reader"])
+        opt = torch.load(checkpoint / "optimizer.pt", map_location=topo.device, weights_only=False)
+        for layer, (adapter, _, optimizer, scheduler) in students.items():
+            adapter.state = _state_to_device(local["students"][layer], topo.device)
+            optimizer.load_state_dict(opt[layer]["optimizer"])
+            scheduler.load_state_dict(opt[layer]["scheduler"])
+            lrs = [cfg["lr"] * lr_factor(step0, cfg, max_steps)] * len(optimizer.param_groups)
+            scheduler.base_lrs = [cfg["lr"]] * len(lrs)
             scheduler.last_epoch = step0
-            scheduler._last_lr = next_lrs
-            for group, lr in zip(optimizer.param_groups, next_lrs):
-                group["lr"] = lr
-                group["initial_lr"] = cfg["lr"]
-            restore_rng(local["rng"])
-        topo.barrier()
-        if topo.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(topo.device)
-        emit(topo, cfg, "stage_start", stage=stage + 1, layer=layer, step=step0)
-        tracker.epoch_steps = max_steps
-        if cfg["training_mode"] == "epoch":
-            emit(topo, cfg, "epoch_plan", stage=stage + 1, total_tokens=reader.total_tokens,
-                 steps=max_steps, rank_chunks=reader.rank_chunks)
-
-        progress = tqdm(total=max_steps, initial=step0, desc=f"Stage {stage + 1}/{len(order)} layer {layer}",
-                        unit="step", dynamic_ncols=True, mininterval=0.5,
-                        disable=topo.rank != topo.leader or os.environ.get("TQDM_DISABLE") == "1")
-        throughput_started = time.perf_counter()
-        throughput_steps = throughput_tokens = 0
-        for step in range(step0 + 1, max_steps + 1):
-            log_step = step % cfg["log_interval"] == 0 or step == 1
-            profile = log_step and os.environ.get("THESEUS_PROFILE", "0") == "1"
-            teacher_seconds = 0.
-            profile_batches = []
-            accum_stats = torch.zeros(3, device=topo.device, dtype=torch.float32)
+            scheduler._last_lr = lrs
+            for group, lr in zip(optimizer.param_groups, lrs):
+                group.update(lr=lr, initial_lr=cfg["lr"])
+        restore_rng(local["rng"])
+    delta.clear()
+    local = opt = group = None
+    topo.barrier()
+    progress = tqdm(total=max_steps, initial=step0, desc=f"Parallel migration ({len(order)} layers)",
+                    unit="step", dynamic_ncols=True, mininterval=0.5,
+                    disable=topo.rank != topo.leader or os.environ.get("TQDM_DISABLE") == "1")
+    for step in range(step0 + 1, max_steps + 1):
+        accum = {layer: torch.zeros(3, device=topo.device) for layer in order}
+        layer_metrics = {}
+        for _, _, optimizer, _ in students.values():
             optimizer.zero_grad(set_to_none=True)
-            for micro in range(cfg["grad_accum_steps"]):
-                batch = reader.next()
-                sync = (nullcontext() if topo.world == 1 or micro == cfg["grad_accum_steps"] - 1
-                        else ddp.no_sync())
-                if batch is None:
-                    # Keep collective ordering identical on exhausted ranks. A
-                    # zero-loss dummy touches the same DDP graph, but contributes
-                    # no tokens and never advances reader or recurrent state.
-                    with sync:
-                        with torch.autocast(topo.device.type, dtype=torch.bfloat16):
-                            dummy = torch.zeros((1, 1, model.config.hidden_size), device=topo.device,
-                                                dtype=torch.bfloat16)
-                            prediction, _ = ddp(dummy, None)
-                        (prediction.float().sum() * 0).backward()
-                    continue
-                ids = batch["ids"].to(topo.device)
+        for micro in range(cfg["grad_accum_steps"]):
+            batch = reader.next()
+            if batch is not None:
                 if batch["reset"]:
                     runner.reset()
+                    for adapter, *_ in students.values():
+                        adapter.state = None
                 if runner.cache.cursor != batch["position"]:
                     raise RuntimeError("Cache position differs from consumed token stream")
-                if profile:
-                    topo.synchronize()
-                    teacher_started = time.perf_counter()
-                adapter.teacher_mode = True
-                try:
-                    runner.forward(ids, through_layer=layer)
-                finally:
-                    adapter.teacher_mode = False
-                if profile:
-                    topo.synchronize()
-                    teacher_seconds += time.perf_counter() - teacher_started
-                    profile_batches.append({"tokens": ids.numel(), "batch_size": ids.shape[0],
-                                            "position": batch["position"], "reset": batch["reset"]})
-                x, target = capture.x, capture.y
+                # Exactly one immutable Qwen pass supplies every layer boundary.
+                runner.forward(batch["ids"].to(topo.device))
+            last_micro = micro == cfg["grad_accum_steps"] - 1
+            for layer in order:
+                adapter, ddp, optimizer, scheduler = students[layer]
+                capture = captures[layer]
+                sync = nullcontext() if topo.world == 1 or last_micro else ddp.no_sync()
                 with sync:
-                    with torch.autocast(topo.device.type, dtype=torch.bfloat16):
-                        prediction, state = ddp(x.detach(), adapter.state)
-                    adapter.state = detach_state(state)
-                    stats = statistics(prediction, target, cfg["loss_epsilon"])
-                    loss_sum(stats, cfg["cosine_weight"]).backward()
-                accum_stats += stats.detach()
-            topo.student_sum(accum_stats)
-            scale = topo.world / accum_stats[2]
-            for p in adapter.core.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(scale)
-            grad_norm = torch.nn.utils.clip_grad_norm_(adapter.core.parameters(), cfg["clip_norm"], error_if_nonfinite=True)
-            lr_used = optimizer.param_groups[0]["lr"]
-            optimizer.step()
-            scheduler.step()
-            if profile:
-                import torch.distributed as dist
-                reports = [None] * topo.world
-                dist.all_gather_object(reports, {"rank": topo.rank, "teacher_seconds": teacher_seconds,
-                                                "batches": profile_batches})
-                emit(topo, cfg, "rank_profile", stage=stage + 1, step=step, ranks=reports)
-            if topo.rank == topo.leader:
-                current_metrics = metrics(accum_stats)
-                throughput_steps += 1
-                throughput_tokens += current_metrics["tokens"]
-                elapsed = time.perf_counter() - throughput_started
-                progress.set_postfix(nmse=f"{current_metrics['nmse']:.5f}",
-                                     rrms=f"{current_metrics['rrms']:.5f}",
-                                     cosine=f"{current_metrics['cosine']:.5f}", refresh=False)
-                progress.update(1)
-                if log_step:
-                    memory = ({"peak_allocated_gb": torch.cuda.max_memory_allocated(topo.device) / 1e9,
-                               "peak_reserved_gb": torch.cuda.max_memory_reserved(topo.device) / 1e9}
-                              if topo.device.type == "cuda" else {})
-                    emit(topo, cfg, "train", stage=stage + 1, layer=layer, step=step,
-                         lr=lr_used, grad_norm=grad_norm.item(),
-                         seconds_per_step=elapsed / throughput_steps,
-                         tokens_per_second=throughput_tokens / elapsed, **current_metrics, **memory)
-                    throughput_started = time.perf_counter()
-                    throughput_steps = throughput_tokens = 0
-            complete = step == max_steps
-            if complete and cfg["training_mode"] == "epoch" and not reader.exhausted:
-                raise RuntimeError("Stage ended before the local token shard was exhausted")
-            if complete or (cfg["validation_interval"] and step % cfg["validation_interval"] == 0):
-                result = validate(topo, cfg, stage, step, runner, layer)
-                emit(topo, cfg, "validation", stage=stage + 1, step=step, **result)
-            total_updates += 1
-            stopping = stop_after is not None and total_updates >= stop_after
-            if complete or stopping or (cfg["checkpoint_interval"] and step % cfg["checkpoint_interval"] == 0):
-                saved = save_checkpoint(topo, cfg, stage, step, complete, order, model, runner,
-                                        reader, optimizer, scheduler, base_id)
-                emit(topo, cfg, "checkpoint", path=str(saved), complete=complete)
-            if stopping:
-                progress.close()
-                if capture:
-                    capture.close()
-                topo.close()
-                return
-        progress.close()
-        if capture:
-            capture.close()
-        if adapter:
-            adapter.__dict__["train_call"] = None
-        del ddp, optimizer, scheduler, adapter
-        promote(topo, model, layer, cfg)
-        runner.reset()
-        meta = None
-    emit(topo, cfg, "finished", stages=len(order))
+                    if batch is None:
+                        # Exhausted ranks still participate in each layer's DDP collectives.
+                        x = torch.zeros((1, 1, model.config.hidden_size), device=topo.device,
+                                        dtype=torch.bfloat16)
+                        with torch.autocast(topo.device.type, dtype=torch.bfloat16):
+                            prediction, state = ddp(x, None)
+                        loss = prediction.float().sum() * 0
+                    else:
+                        x, target = capture.x, capture.y
+                        with torch.autocast(topo.device.type, dtype=torch.bfloat16):
+                            prediction, state = ddp(x, adapter.state)
+                        adapter.state = detach_state(state)
+                        stats = statistics(prediction, target, cfg["loss_epsilon"])
+                        accum[layer] += stats.detach()
+                        # Normalize the accumulated token sum after DDP reduction.
+                        loss = stats[0]
+                    loss.backward()
+                # No autograd-connected tensor survives this layer's backward.
+                del prediction, state, loss, x
+                if batch is not None:
+                    del stats, target
+                capture.x = capture.y = None
+                if last_micro:
+                    topo.student_sum(accum[layer])
+                    count = accum[layer][2]
+                    if count.item() <= 0:
+                        raise RuntimeError("No training tokens in update")
+                    for p in adapter.core.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(topo.world / count)
+                    norm = torch.nn.utils.clip_grad_norm_(adapter.core.parameters(), cfg["clip_norm"],
+                                                         error_if_nonfinite=True)
+                    lr = optimizer.param_groups[0]["lr"]
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    layer_metrics[f"layer_{layer:02d}"] = metrics(accum[layer]) | {"grad_norm": norm.item(), "lr": lr}
+        summary = summarize_layers(layer_metrics)
+        progress.set_postfix(sum_loss=f"{summary['sum_loss']:.5f}", mean_cos=f"{summary['mean_cos']:.5f}", refresh=False)
+        progress.update(1)
+        if step % cfg["log_interval"] == 0 or step == 1:
+            emit(topo, cfg, "train", step=step, **summary,
+                 tokens=next(iter(layer_metrics.values()))["tokens"], layers=layer_metrics)
+        complete = step == max_steps
+        if complete and cfg["training_mode"] == "epoch" and not reader.exhausted:
+            raise RuntimeError("Training ended before the local token shard was exhausted")
+        if complete or (cfg["validation_interval"] and step % cfg["validation_interval"] == 0):
+            result = validate_parallel(topo, cfg, runner, students, captures)
+            emit(topo, cfg, "validation", step=step, **result)
+        stopping = stop_after is not None and step - step0 >= stop_after
+        if complete or stopping or (cfg["checkpoint_interval"] and step % cfg["checkpoint_interval"] == 0):
+            saved = save_checkpoint(topo, cfg, 0, step, complete, order, model, runner,
+                                    reader, None, None, base_id, students=students)
+            emit(topo, cfg, "checkpoint", path=str(saved), complete=complete)
+        if stopping and not complete:
+            progress.close()
+            for capture in captures.values():
+                capture.close()
+            topo.close()
+            return
+    progress.close()
+    for capture in captures.values():
+        capture.close()
+    # Release teacher, caches, DDP and Adam before reloading the pristine base.
+    weights = {i: cpu_tree(item[0].core.state_dict()) for i, item in students.items()}
+    students.clear()
+    adapter = ddp = optimizer = scheduler = p = norm = local = opt = delta = group = None
+    _ = None
+    del runner, model
+    import gc
+    gc.collect()
+    if topo.device.type == "cuda":
+        torch.cuda.empty_cache()
+    model = load_model(cfg["model"], topo.device)
+    for layer in order:
+        install(model, layer, cfg, weights[layer])
+    del weights
+    runner = Runner(model)
+    result = validate_composition(topo, cfg, runner)
+    emit(topo, cfg, "composition_validation", **result)
+    if topo.rank == topo.leader:
+        from theseus.inference import save_export
+        save_export(model, Path(cfg["output"]) / "converted", cfg, order, base_id, checkpoint=saved)
+    topo.barrier()
+    emit(topo, cfg, "finished", layers=len(order), export=str(Path(cfg["output"]) / "converted"))
     topo.close()
 
 

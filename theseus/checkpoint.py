@@ -80,14 +80,16 @@ def resolve_checkpoint(path):
 def read_checkpoint(path):
     path = resolve_checkpoint(path)
     meta = json.loads((path / "manifest.json").read_text())
-    if meta["format"] != 1:
+    if meta["format"] not in (1, 2):
         raise ValueError("Unsupported checkpoint format")
     return path, meta, split_delta(load_file(str(path / "migrated.safetensors")))
 
 
-def save_checkpoint(topo, cfg, stage, step, complete, order, model, runner, reader, optimizer, scheduler, base_id):
+def save_checkpoint(topo, cfg, stage, step, complete, order, model, runner, reader, optimizer, scheduler, base_id, students=None):
     root = Path(cfg["output"])
     name = f"stage_{stage + 1:02d}_step_{step:08d}" + ("_complete" if complete else "")
+    if students is not None:
+        name = f"parallel_step_{step:08d}" + ("_complete" if complete else "")
     final, temp = root / name, root / ("." + name + ".tmp")
     if topo.rank == topo.leader:
         root.mkdir(parents=True, exist_ok=True)
@@ -96,15 +98,24 @@ def save_checkpoint(topo, cfg, stage, step, complete, order, model, runner, read
         (temp / "ranks").mkdir(parents=True)
     topo.barrier()
     torch.save(cpu_tree({"runner": runner.state_dict(), "reader": reader.state_dict() if reader else None,
-                         "rng": rng_state()}), temp / "ranks" / f"rank_{topo.rank:05d}.pt")
+                         "rng": rng_state(),
+                         "students": {i: item[0].state for i, item in students.items()} if students is not None else {}}), temp / "ranks" / f"rank_{topo.rank:05d}.pt")
     if topo.rank == topo.leader:
-        save_file(delta_state(model), str(temp / "migrated.safetensors"))
-        torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()}, temp / "optimizer.pt")
+        weights = (delta_state(model) if students is None else
+                   {f"{i}.{k}": v.detach().cpu().contiguous()
+                    for i, item in students.items() for k, v in item[0].core.state_dict().items()})
+        save_file(weights, str(temp / "migrated.safetensors"))
+        optim = ({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()} if students is None else
+                 {i: {"optimizer": item[2].state_dict(), "scheduler": item[3].state_dict()}
+                  for i, item in students.items()})
+        torch.save(cpu_tree(optim), temp / "optimizer.pt")
         meta = {"format": 1, "training_topology": "local_branch_v1", "stage": stage, "step": step, "complete": complete,
                 "order": order, "config": cfg, "world": topo.world,
                 "base_fingerprint": base_id, "train_fingerprint": digest_file(cfg["train_manifest"]),
                 "validation_fingerprint": digest_file(cfg["validation_manifest"]),
                 "torch": torch.__version__, "transformers": transformers.__version__}
+        if students is not None:
+            meta.update(format=2, training_topology="parallel_layers_v1")
         (temp / "manifest.json").write_text(json.dumps(meta, indent=2))
     topo.barrier()
     if topo.rank == topo.leader:
@@ -123,7 +134,7 @@ def validate_resume(meta, cfg, topo, base_id, order):
     if meta["base_fingerprint"] != base_id:
         raise ValueError("Base weights changed")
     if meta["order"] != order:
-        raise ValueError("Migration order changed; start a new run. Deep-to-shallow checkpoints cannot resume shallow-to-deep training.")
+        raise ValueError("Migration layer order changed; start a new run.")
     for name in ("train", "validation"):
         if meta[name + "_fingerprint"] != digest_file(cfg[name + "_manifest"]):
             raise ValueError(f"{name} manifest changed")
@@ -136,7 +147,7 @@ def validate_resume(meta, cfg, topo, base_id, order):
         if cfg[key] != meta["config"].get(key, default):
             raise ValueError(f"Resume config changed: {key}")
     if not meta["complete"]:
-        if meta.get("training_topology") != "local_branch_v1":
+        if meta.get("training_topology") not in {"local_branch_v1", "parallel_layers_v1"}:
             raise ValueError("Old paired mid-stage checkpoints cannot resume local-branch training; use a completed stage")
         if meta["world"] != topo.world:
             raise ValueError("Mid-stream resume needs identical rank topology")

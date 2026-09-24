@@ -138,7 +138,7 @@ def migration_order(model, expected=16):
     return order
 
 
-def install(model, layer, options, weights=None, trainable=False, retain_teacher=False):
+def install(model, layer, options, weights=None, trainable=False, retain_teacher=False, attach=True):
     device = next(model.parameters()).device
     with torch.device("meta" if weights is not None else device):
         core = TimeMix(model.config.hidden_size, layer, model.config.num_hidden_layers,
@@ -151,7 +151,8 @@ def install(model, layer, options, weights=None, trainable=False, retain_teacher
     if retain_teacher:
         adapter.teacher = model.model.layers[layer].self_attn
         adapter.teacher.requires_grad_(False).eval()
-    model.model.layers[layer].self_attn = adapter
+    if attach:
+        model.model.layers[layer].self_attn = adapter
     return adapter
 
 

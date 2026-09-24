@@ -1,73 +1,45 @@
-# RWKV-Theseus：同卡分支蒸馏
+# RWKV-Theseus：Parallel Layer Migration
 
-当前实现使用每卡一份模型、每卡一个本地 teacher 分支、全 rank TimeMix DDP。它替代原来的 teacher/student GPU 1:1 配对，保留外围 JSONL 转换和 manifest 格式；默认使用新增的完整 epoch reader。
+每个 rank 拥有一份始终冻结的原始 Qwen，以及 16 个独立 DDP TimeMix。沿用原有 manifest、数据 reader、HF Runner、NMSE、原子 checkpoint 和 W&B 接口。原始 Qwen3.8-27B 的替换位置是 decoder 层 `3,7,...,63`；其余 Gated DeltaNet、MLP、embedding、norm 和输出权重不变。
 
-## 模型与迁移顺序
+## 每个微批次
 
-HF 原生 Qwen3.5 文本实现加载本地 Qwen3.8-27B 权重，负责冻结的 embedding、GDN、Attention、RoPE、norm 与 MLP。64 个 decoder block 中的 16 个 full-attention 按 `3,7,...,63` 迁移。每阶段只训练一个新的 RWKV7 TimeMix，其余参数冻结。
+1. reader 提供 token chunk；窗口切换时同时重置原始 HF cache 和所有 TMix state。
+2. 原始 Qwen 完整 forward 一次，16 个 Capture 同时收集各自 input norm 之后、attention residual 之前的原始 input/target，全部 detach。teacher 无任何 TMix 子模块。
+3. 按层执行 `DDP(TimeMix)(teacher_input, own_state)`，独立计算该层逐 token NMSE，单独 backward，立即丢弃所有本层 autograd 引用。state detach 后跨 chunk 延续。
+4. 每层独立进行有效 token 归一化、梯度裁剪、AdamW step、scheduler step、zero_grad。`grad_accum_steps > 1` 时仅累计梯度，最后一个微批次逐层更新；计算图仍在每次 backward 后释放。
 
-TimeMix 和 CUDA recurrence 代码直接位于 `theseus/timemix.py`、`theseus/wkv7.py` 与 `kernels/`，上游来源与适配说明保留在文件头，许可证见 LICENSE-RWKV7。不依赖上游 Lightning/DeepSpeed trainer。
+没有把 16 层 loss 合并后反向，没有已经训练好的 TMix 参与 teacher forward。Parallel 表示所有层共享一次原始 teacher pass 并在同一训练遍历中迁移，TMix 计算按层串行以限制激活显存。
 
-## 单卡每个 chunk 的路径
+## 损失与分布式
 
-```text
-固定数据集 tokens → 冻结 HF 前缀 → input norm → x
-                                            ├→ 原 FullAttention → y（无梯度）
-                                            └→ DDP(TimeMix) → prediction（有梯度）
-                                                        ↓
-                                             逐 token NMSE / 可选 cosine
-```
+`NMSE_t = mean((prediction_t-target_t)^2) / max(mean(target_t^2), epsilon)`。每层 loss 使用 token sum 反向；DDP 平均梯度后乘 `world_size / global_valid_tokens`，得到全局 token 均值梯度。随后只裁剪本层参数，记录裁剪前范数。cosine 仅作监控，`cosine_weight` 必须为 0。
 
-当前层包装器同时持有原始 attention 与新增 TimeMix。训练前缀 forward 临时切入 teacher 分支，捕获点在 input norm 之后、attention residual 之前，目标包括 Attention 内部 gate/o_proj。然后独立调用 DDP(TimeMix)，输入就是捕获到的同一份 x。
+所有层共享 reader 和更新步数，但分别拥有 optimizer、scheduler 和 recurrent state。耗尽 rank 每层运行零损失 dummy 来保持 collective 顺序，不推进本地 recurrent state；有效 token 计数不会重复乘层数。
 
-训练时在目标 attention 安装临时 forward hook，获得输出后退出 HF forward，并在 finally 移除 hook；当前 block 的 residual/MLP、后续 decoder block 和最终 norm 均不执行。此前完成的 KV/GDN cache 更新保留，无需改写 HF 内部 forward。TimeMix 输出之后仅计算 loss/backward，不运行 student 后缀。
+BF16 forward；TMix 参数、梯度、Adam 状态和损失为 FP32。原始 HF cache 以及全部 detached input/target 同时驻留，16 份 TMix 参数和 optimizer state 也同时驻留；只有当前层的反向激活存活。其显存需求不能套用旧单层 stage 的测量。
 
-按从浅到深迁移，已经迁移的 TimeMix 都在目标层之前，作为冻结前缀参与计算，其 recurrent state 随 chunk 延续。Teacher 是本阶段替换前的混合模型；两个分支共用这份前缀产生的同一个 x，并非另跑原始全 Attention 前缀。局部损失不依赖模型后缀，故可共享此前的全部计算。完整 student 路径仍在验证时执行。
+## 日志与验证
 
-## 状态与损失
+CLI 与 W&B 顶层训练指标仅有 `sum_loss = Σ NMSE_i` 和 `mean_cos = mean(cos_i)`。W&B 按实际 decoder 编号分组，如 `layer_03/{nmse,cosine,rrms,grad_norm,lr}`；RRMS 为 `sqrt(NMSE)`。`progress/global_step` 是共同更新步数。验证以 `val/` 为前缀。
 
-每个 rank 保留三类训练状态：冻结前缀的 HF KV/GDN cache、目标 FullAttention 的 KV cache、当前 TimeMix 的 previous-input shift 与 FP32 recurrent state。HF cache 和 TimeMix state 各自更新。同一窗口内连续传递，切换窗口时统一 reset。
+训练期间验证使用隔离的原始 teacher cache 和各层临时 TMix state，只比较各层原始 input/target，不组装混合模型、不更改训练 reader/state。完整模型的 composition validation 只在所有层完成后进行。
 
-一次 forward 处理一个 chunk，默认 256 token。每个 token 在相同位置计算 NMSE；chunk 内 TimeMix 做 BPTT，chunk 边界 detach state。BF16 forward，当前 TimeMix 参数/梯度与 AdamW 状态为 FP32，loss 为 FP32。
+## Checkpoint 与恢复
 
-```text
-NMSE_t = mean((prediction_t - y_t)^2) / max(mean(y_t^2), epsilon)
-loss_t = NMSE_t + cosine_weight * (1 - cosine_t)
-RRMS = sqrt(mean(NMSE_t))
-```
+格式 2 使用 `training_topology=parallel_layers_v1`，目录名 `parallel_step_XXXXXXXX[_complete]`。
 
-所有 rank 累积 loss 的 token 和后执行 backward。DDP 默认平均梯度，再乘 `world_size / 全局有效 token 数` 得到全局逐 token 平均梯度。不等长 chunk 不会被等权平均。梯度累积只在最后一个 micro-step 同步。
+- `migrated.safetensors`：全部 16 层 TMix 权重，键为 `<decoder_layer>.<parameter>`，不包含任何 Qwen/base 参数。
+- `optimizer.pt`：按层保存 AdamW 和 scheduler state。
+- `ranks/rank_XXXXX.pt`：每 rank reader cursor、RNG、原始 HF cache/cursor，以及全部 TMix detached recurrent state。
+- `manifest.json`：配置、层顺序、公共 step/complete、模型和数据指纹、world size 和软件版本。
 
-## rank 与数据
+所有层更新完成后统一原子提交 `COMMITTED` 和 `latest`。中途恢复要求原始模型、数据与 rank 拓扑一致，同时恢复全部层权重、optimizer/scheduler 和流状态。旧 sequential checkpoint 不能继续 parallel 训练，避免把混合 teacher 历史误作原始 teacher 数据。
 
-每张 GPU 一个 torchrun rank，各自持有完整冻结模型和当前 TimeMix，所有 rank 都训练。支持单卡、奇数卡、偶数卡；多节点要求每节点相同进程数。
+## 最终组装和独立加载
 
-一个 Gloo world group 用于控制、配置一致性、提交 checkpoint 和阶段权重广播；一个覆盖全部 rank 的 NCCL group 用于 CUDA DDP 与指标归约。只有 TimeMix core 进入 DDP。没有 pair group、跨卡 hidden 发送或 ACK。
+全部训练完成后，先提交最终 delta checkpoint，释放 teacher、DDP、Adam 和 cache，再重新加载原始 Qwen，将所有目标 attention 一次性替换为训练好的 TMix。执行完整组装 forward 的有限值检查，以及配置启用时的原始 teacher KL。其他 Qwen 权重不变。
 
-EpochTokenStream 通过 `pair_id=rank, pairs=world_size` 兼容其既有分片接口。这些字段只代表数据分片编号，不再表示 teacher/student 配对。每阶段仍从同一个 seed、manifest 的完整遍历起点开始。改变卡数会改变每步有效 token 数和数据分片；中途精确恢复要求 world size 不变。
+仅在此阶段向 `output/converted/` 原子导出完整 safetensors 权重、config、TimeMix 元数据和可用的 tokenizer 文件。使用 `theseus.inference.load_export(path, device=...)` 加载；不需要原始 Qwen 目录。自定义 TMix/cache 仍需本项目 runtime，不使用 stock AutoModel。最终 delta 已提交而导出未完成时，可从 complete checkpoint 恢复来完成组装导出。
 
-## 阶段与 checkpoint
-
-每阶段初始化一个 FP32 TimeMix、DDP、AdamW 和 warmup scheduler。阶段末验证并保存 complete checkpoint，然后释放旧 DDP/optimizer，将该层转成冻结 BF16 TimeMix，移除原 attention，广播权重并进入更深层。16 个阶段自动连续运行。
-
-checkpoint 的迁移权重仅包含各 TimeMix core；原 attention 从不可变基座加载。每 rank 保存 reader cursor、HF cache、TimeMix state 和 RNG；rank 0 保存 optimizer/scheduler 与全体迁移层权重。先写临时目录，所有 rank 完成后写 COMMITTED，最后原子更新 latest。
-
-manifest 使用 `training_topology=local_branch_v1` 区分拓扑。旧配对版的阶段中途 checkpoint 无法精确恢复，因此明确拒绝；只有迁移顺序一致的旧 complete checkpoint 才可以从下一阶段开始。配置、基座和数据指纹继续校验。
-
-## 验证与导出
-
-验证不修改训练 reader 或 cache。每 rank 从独立验证 reader 取样，用同一份模型先运行当前原 attention 分支，再以独立状态重放完整 student。只将有限个验证 chunk 的边界 x/y 暂存在 CPU，报告 teacher-forced 与实际 student forward 的 NMSE/RRMS/cosine。`debug_input` 在验证中额外核对边界输入。
-
-可选最终 logits KL：从磁盘临时恢复所有原 attention 得到 M0，把验证隐藏状态暂存 CPU；恢复 student 后重放相同 tokens，分块计算 `KL(p_M0 || p_student)`。不同时驻留第二份完整模型。所有状态在退出验证时恢复，指标跨全 rank 汇总。
-
-最终 export 只包含迁移 delta 和基座引用；推理时由项目 loader 在 HF 模型中安装 TimeMix。具体启动、数据格式、超参数和 W&B 配置见 README.md。
-
-## 完整 epoch 模式（当前默认）
-
-`EpochTokenStream` 只读现有 manifest/sidecar。所有文档切成不重叠 context 窗口，短尾保留；窗口确定性打乱后按 rank 分片。每个 stage 每个 token 恰好参与一次训练，source 权重不用于重复抽样。每阶段复用相同顺序。
-
-以各 rank 最大 chunk 数除以 grad_accum_steps 向上取整计算 optimizer step 总数。提前耗尽的 rank 用零损失 TimeMix forward/backward 匹配 DDP collective，不修改 recurrent state、不记入 token 数。每步仍按全局有效 token 数归一化。stage_steps 仅在显式 sampled 模式下有效。
-
-checkpoint_interval 默认 3000，阶段结束也保存。reader 保存 epoch_v1 模式、窗口/offset/消费 token 数；旧 sampled 中途 checkpoint 无法恢复成完整 epoch。默认运行目录改为 runs/theseus_shallow_to_deep，保留旧训练结果。
-
-由浅入深训练使用新输出目录 `runs/theseus_shallow_to_deep`。此前由深到浅的 checkpoint 迁移顺序不同，不能续训到新流程；请不带 `--resume` 启动新训练。旧 runs 和 data 保留不动。
+TimeMix/WKV7 来源和许可证见 `theseus/timemix.py`、`theseus/wkv7.py`、`kernels/` 及 `LICENSE-RWKV7`。

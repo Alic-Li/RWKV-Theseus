@@ -20,9 +20,9 @@ def lr_factor(step_index, cfg, total_steps):
     return floor + (1. - floor) * .5 * (1. + math.cos(math.pi * progress))
 
 
-def prepare_student(model, layer, cfg, topo, weights=None, *, total_steps):
+def prepare_student(model, layer, cfg, topo, weights=None, *, total_steps, detached=False):
     model.requires_grad_(False)
-    adapter = install(model, layer, cfg, weights=weights, trainable=True, retain_teacher=True)
+    adapter = install(model, layer, cfg, weights=weights, trainable=True, retain_teacher=not detached, attach=not detached)
     adapter.debug_input = cfg["debug_input"]
     if topo.world == 1:
         ddp = adapter.core

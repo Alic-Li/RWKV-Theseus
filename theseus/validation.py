@@ -141,3 +141,51 @@ def validate_original_kl(topo, cfg, stage, step, runner):
                 total[1] += logits.shape[0] * logits.shape[1]
     topo.student_sum(total)
     return {"original_teacher_kl": (total[0] / total[1]).item()}
+
+
+def summarize_layers(layers):
+    return {"sum_loss": sum(item["nmse"] for item in layers.values()),
+            "mean_cos": sum(item["cosine"] for item in layers.values()) / len(layers)}
+
+
+@torch.no_grad()
+def validate_parallel(topo, cfg, runner, students, captures):
+    """Validate independent students on original teacher boundaries only."""
+    totals = {i: torch.zeros(3, device=topo.device) for i in students}
+    states = {i: None for i in students}
+    reader = reader_for(cfg, topo, validation=True)
+    with isolated_state(runner):
+        for _ in range(cfg["validation_chunks"]):
+            batch = reader.next()
+            if batch["reset"]:
+                runner.reset()
+                states = {i: None for i in students}
+            runner.forward(batch["ids"].to(topo.device))
+            for i, (adapter, *_) in students.items():
+                capture = captures[i]
+                with torch.autocast(topo.device.type, dtype=torch.bfloat16):
+                    prediction, states[i] = adapter.core(capture.x, states[i])
+                totals[i] += statistics(prediction, capture.y, cfg["loss_epsilon"])
+                capture.x = capture.y = None
+    for total in totals.values():
+        topo.student_sum(total)
+    layers = {f"layer_{i:02d}": metrics(total) for i, total in totals.items()}
+    return summarize_layers(layers) | {"layers": layers}
+
+
+@torch.no_grad()
+def validate_composition(topo, cfg, runner):
+    """Final-only assembled forward smoke check and optional original-teacher KL."""
+    reader = reader_for(cfg, topo, validation=True)
+    with isolated_state(runner):
+        for _ in range(cfg["validation_chunks"]):
+            batch = reader.next()
+            if batch["reset"]:
+                runner.reset()
+            hidden = runner.forward(batch["ids"].to(topo.device))
+            if not torch.isfinite(hidden).all():
+                raise RuntimeError("Nonfinite assembled model output")
+    results = {"finite": True}
+    if cfg["original_teacher_kl"]:
+        results.update(validate_original_kl(topo, cfg, 0, 0, runner))
+    return results

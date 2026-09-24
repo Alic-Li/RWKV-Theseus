@@ -3,7 +3,7 @@ from pathlib import Path
 
 DEFAULTS = {
     "model": "../Qwen3.8-27B", "train_manifest": "data/train/manifest.json",
-    "validation_manifest": "data/val/manifest.json", "output": "runs/theseus_shallow_to_deep",
+    "validation_manifest": "data/val/manifest.json", "output": "runs/theseus_parallel",
     "expected_attention_layers": 16, "head_size": 64, "backend": "cuda", "seed": 42,
     "chunk_tokens": 256, "context_tokens": 4096, "stage_steps": 1000, "training_mode": "epoch",
     "lr": 1e-4, "betas": [0.9, 0.999], "adam_eps": 1e-8, "weight_decay": 0.01,
@@ -38,6 +38,11 @@ def load_config(path):
         steps = cfg["stage_steps"] if isinstance(cfg["stage_steps"], list) else [cfg["stage_steps"]]
         if len(steps) not in (1, cfg["expected_attention_layers"]) or min(steps) < 1:
             raise ValueError("stage_steps must be positive or a per-stage list")
+    steps = cfg["stage_steps"]
+    if isinstance(steps, list) and len(set(steps)) != 1:
+        raise ValueError("Parallel migration requires equal stage_steps for all layers")
+    if cfg["cosine_weight"] != 0:
+        raise ValueError("Parallel migration optimizes NMSE only; cosine_weight must be zero")
     if cfg["lr"] <= 0 or cfg["warmup_steps"] < 0 or cfg["clip_norm"] <= 0:
         raise ValueError("Invalid optimization configuration")
     for name in ("warmup_steps", "constant_steps"):
